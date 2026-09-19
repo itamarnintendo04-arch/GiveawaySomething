@@ -1,12 +1,103 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
+from aiohttp import web
 import asyncio
 import random
 import datetime
 import os
 
-# Set up bot intents
+# --- WEB SERVER SETTINGS (Fake Landing Page) ---
+HTML_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GiveawaySomething Bot</title>
+    <style>
+        body {
+            background-color: #0f172a;
+            color: #ffffff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+            text-align: center;
+        }
+        .container {
+            background: #1e293b;
+            padding: 40px;
+            border-radius: 16px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            max-width: 400px;
+            width: 90%;
+            border: 1px solid #334155;
+        }
+        h1 {
+            color: #38bdf8;
+            margin-bottom: 10px;
+        }
+        p {
+            color: #94a3b8;
+            font-size: 1.1em;
+            margin-bottom: 25px;
+        }
+        .status {
+            display: inline-block;
+            padding: 8px 16px;
+            background-color: #22c55e;
+            color: #ffffff;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 0.9em;
+            margin-bottom: 20px;
+        }
+        .btn {
+            display: inline-block;
+            background-color: #5865F2;
+            color: white;
+            padding: 12px 24px;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: bold;
+            transition: background 0.3s;
+        }
+        .btn:hover {
+            background-color: #4752C4;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎉 GiveawaySomething</h1>
+        <div class="status">● Bot Status: ONLINE</div>
+        <p>The ultimate giveaway & quick-drop bot for your Discord server.</p>
+        <a href="#" class="btn">Add to Discord</a>
+    </div>
+</body>
+</html>
+"""
+
+async def handle_index(request):
+    return web.Response(text=HTML_PAGE, content_type='text/html')
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_index)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render assigns a PORT dynamically via environment variables
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web server started on port {port}")
+
+
+# --- DISCORD BOT SETTINGS ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -38,7 +129,6 @@ class GiveawayView(discord.ui.View):
 
         participants.add(user_id)
         
-        # Update embed footer with participant count
         embed = interaction.message.embeds[0]
         embed.set_footer(
             text=f"GiveawaySomething • {len(participants)} Participants • Hosted by ItamaRos",
@@ -63,14 +153,13 @@ class GiveawayView(discord.ui.View):
 
         participants.remove(user_id)
 
-        # Update embed footer with participant count
         embed = interaction.message.embeds[0]
         embed.set_footer(
             text=f"GiveawaySomething • {len(participants)} Participants • Hosted by ItamaRos",
             icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png"
         )
         await interaction.message.edit(embed=embed)
-        await interaction.response.send_message(" You have left the giveaway.", ephemeral=True)
+        await interaction.response.send_message("You have left the giveaway.", ephemeral=True)
 
 
 class DropView(discord.ui.View):
@@ -89,7 +178,6 @@ class DropView(discord.ui.View):
         self.claimed = True
         winner = interaction.user
 
-        # Disable button after claim
         button.disabled = True
         button.label = "CLAIMED! 🎁"
         button.style = discord.ButtonStyle.secondary
@@ -151,12 +239,11 @@ async def start_giveaway(interaction: discord.Interaction, duration: int, prize:
 
     active_giveaways[msg.id] = set()
 
-    # Wait for duration
     await asyncio.sleep(duration)
 
-    # Giveaway ended
     participants_list = list(active_giveaways.get(msg.id, set()))
-    del active_giveaways[msg.id]
+    if msg.id in active_giveaways:
+        del active_giveaways[msg.id]
 
     if not participants_list:
         ended_embed = discord.Embed(
@@ -201,10 +288,15 @@ async def start_drop(interaction: discord.Interaction, prize: str):
     await interaction.channel.send(embed=embed, view=view)
 
 
-# שליפת הטוקן מתוך משתני הסביבה (Environment Variables) ב-Render
-TOKEN = os.getenv("DISCORD_TOKEN")
+async def main():
+    TOKEN = os.getenv("DISCORD_TOKEN")
+    if not TOKEN:
+        print("Error: DISCORD_TOKEN environment variable is missing!")
+        return
 
-if TOKEN:
-    bot.run(TOKEN)
-else:
-    print("Error: DISCORD_TOKEN environment variable is not set!")
+    # Start Web Server & Bot concurrently
+    await start_web_server()
+    await bot.start(TOKEN)
+
+if __name__ == "__main__":
+    asyncio.run(main())
