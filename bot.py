@@ -6,8 +6,9 @@ import asyncio
 import random
 import datetime
 import os
+import re
 
-# --- WEB SERVER SETTINGS (Fake Landing Page) ---
+# --- FAKE LANDING PAGE WEB SERVER ---
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -37,15 +38,8 @@ HTML_PAGE = """
             width: 90%;
             border: 1px solid #334155;
         }
-        h1 {
-            color: #38bdf8;
-            margin-bottom: 10px;
-        }
-        p {
-            color: #94a3b8;
-            font-size: 1.1em;
-            margin-bottom: 25px;
-        }
+        h1 { color: #38bdf8; margin-bottom: 10px; }
+        p { color: #94a3b8; font-size: 1.1em; margin-bottom: 25px; }
         .status {
             display: inline-block;
             padding: 8px 16px;
@@ -64,10 +58,6 @@ HTML_PAGE = """
             text-decoration: none;
             border-radius: 8px;
             font-weight: bold;
-            transition: background 0.3s;
-        }
-        .btn:hover {
-            background-color: #4752C4;
         }
     </style>
 </head>
@@ -90,14 +80,13 @@ async def start_web_server():
     app.router.add_get('/', handle_index)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render assigns a PORT dynamically via environment variables
     port = int(os.getenv("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     print(f"Web server started on port {port}")
 
 
-# --- DISCORD BOT SETTINGS ---
+# --- DISCORD BOT SETUP ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -108,12 +97,31 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Active giveaways store: message_id -> set of user_ids
 active_giveaways = {}
 
+# Time parser helper function
+def parse_duration(time_str: str) -> int:
+    match = re.match(r"^(\d+)([smhd])?$", time_str.lower().strip())
+    if not match:
+        return -1
+    
+    amount = int(match.group(1))
+    unit = match.group(2)
+    
+    if unit == 'm':
+        return amount * 60
+    elif unit == 'h':
+        return amount * 3600
+    elif unit == 'd':
+        return amount * 86400
+    else:
+        return amount # Default to seconds if 's' or no unit is provided
+
+
 class GiveawayView(discord.ui.View):
     def __init__(self, message_id: int):
         super().__init__(timeout=None)
         self.message_id = message_id
 
-    @discord.ui.button(label="Join 🎉", style=discord.ButtonStyle.success, custom_id="join_giveaway_btn")
+    @discord.ui.button(label="Join 🎉 (0)", style=discord.ButtonStyle.success, custom_id="join_giveaway_btn")
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         msg_id = interaction.message.id
         user_id = interaction.user.id
@@ -129,12 +137,14 @@ class GiveawayView(discord.ui.View):
 
         participants.add(user_id)
         
+        button.label = f"Join 🎉 ({len(participants)})"
+        
         embed = interaction.message.embeds[0]
         embed.set_footer(
             text=f"GiveawaySomething • {len(participants)} Participants • Hosted by ItamaRos",
             icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png"
         )
-        await interaction.message.edit(embed=embed)
+        await interaction.message.edit(embed=embed, view=self)
         await interaction.response.send_message("🎉 You have successfully joined the giveaway!", ephemeral=True)
 
     @discord.ui.button(label="Leave ✖️", style=discord.ButtonStyle.danger, custom_id="leave_giveaway_btn")
@@ -153,12 +163,14 @@ class GiveawayView(discord.ui.View):
 
         participants.remove(user_id)
 
+        self.children[0].label = f"Join 🎉 ({len(participants)})"
+
         embed = interaction.message.embeds[0]
         embed.set_footer(
             text=f"GiveawaySomething • {len(participants)} Participants • Hosted by ItamaRos",
             icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png"
         )
-        await interaction.message.edit(embed=embed)
+        await interaction.message.edit(embed=embed, view=self)
         await interaction.response.send_message("You have left the giveaway.", ephemeral=True)
 
 
@@ -200,18 +212,23 @@ async def on_ready():
     print(f"Logged in as {bot.user.name} (GiveawaySomething) - Slash commands synced!")
 
 
-@bot.tree.command(name="giveaway", description="Start a timed giveaway!")
+@bot.tree.command(name="giveaway", description="Start a timed giveaway! (Admin Only)")
 @app_commands.describe(
-    duration="Duration in seconds",
+    duration="Time format: 30s, 10m, 2h, 1d",
     prize="What are you giving away?",
     winners="Number of winners (default: 1)"
 )
-async def start_giveaway(interaction: discord.Interaction, duration: int, prize: str, winners: int = 1):
+async def start_giveaway(interaction: discord.Interaction, duration: str, prize: str, winners: int = 1):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("You need Administrator permissions to start a giveaway!", ephemeral=True)
+        await interaction.response.send_message("❌ You need Administrator permissions to start a giveaway!", ephemeral=True)
         return
 
-    end_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=duration)
+    seconds = parse_duration(duration)
+    if seconds <= 0:
+        await interaction.response.send_message("❌ Invalid duration format! Use formats like `30s`, `10m`, `2h`, or `1d`.", ephemeral=True)
+        return
+
+    end_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
     timestamp_format = f"<t:{int(end_time.timestamp())}:R>"
 
     embed = discord.Embed(
@@ -239,7 +256,7 @@ async def start_giveaway(interaction: discord.Interaction, duration: int, prize:
 
     active_giveaways[msg.id] = set()
 
-    await asyncio.sleep(duration)
+    await asyncio.sleep(seconds)
 
     participants_list = list(active_giveaways.get(msg.id, set()))
     if msg.id in active_giveaways:
@@ -269,11 +286,83 @@ async def start_giveaway(interaction: discord.Interaction, duration: int, prize:
         await interaction.channel.send(f"🎉 Congratulations {winner_mentions}! You won **{prize}**! 🎁")
 
 
-@bot.tree.command(name="drop", description="Start a drop giveaway! First person to click wins!")
+@bot.tree.command(name="participants", description="See all participants of an active giveaway (Admin Only)")
+@app_commands.describe(message_id="The ID of the giveaway message")
+async def list_participants(interaction: discord.Interaction, message_id: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ You need Administrator permissions to use this command!", ephemeral=True)
+        return
+
+    try:
+        msg_id = int(message_id)
+    except ValueError:
+        await interaction.response.send_message("❌ Please enter a valid message ID!", ephemeral=True)
+        return
+
+    if msg_id not in active_giveaways:
+        await interaction.response.send_message("❌ Giveaway not found or already ended!", ephemeral=True)
+        return
+
+    participants = active_giveaways[msg_id]
+    if not participants:
+        await interaction.response.send_message("There are currently no participants in this giveaway.", ephemeral=True)
+        return
+
+    user_mentions = "\n".join([f"• <@{u_id}>" for u_id in participants])
+    embed = discord.Embed(
+        title="📋 Giveaway Participants",
+        description=f"**Total:** {len(participants)}\n\n{user_mentions}",
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="remove_participant", description="Remove a user from an active giveaway (Admin Only)")
+@app_commands.describe(message_id="The ID of the giveaway message", user="The user to remove")
+async def remove_participant(interaction: discord.Interaction, message_id: str, user: discord.Member):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ You need Administrator permissions to use this command!", ephemeral=True)
+        return
+
+    try:
+        msg_id = int(message_id)
+    except ValueError:
+        await interaction.response.send_message("❌ Please enter a valid message ID!", ephemeral=True)
+        return
+
+    if msg_id not in active_giveaways:
+        await interaction.response.send_message("❌ Giveaway not found or already ended!", ephemeral=True)
+        return
+
+    participants = active_giveaways[msg_id]
+    if user.id not in participants:
+        await interaction.response.send_message(f"❌ {user.mention} is not in this giveaway!", ephemeral=True)
+        return
+
+    participants.remove(user.id)
+
+    try:
+        msg = await interaction.channel.fetch_message(msg_id)
+        embed = msg.embeds[0]
+        embed.set_footer(
+            text=f"GiveawaySomething • {len(participants)} Participants • Hosted by ItamaRos",
+            icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png"
+        )
+        
+        view = GiveawayView(msg_id)
+        view.children[0].label = f"Join 🎉 ({len(participants)})"
+        await msg.edit(embed=embed, view=view)
+    except Exception:
+        pass
+
+    await interaction.response.send_message(f"✅ Successfully removed {user.mention} from the giveaway!", ephemeral=True)
+
+
+@bot.tree.command(name="drop", description="Start a drop giveaway! (Admin Only)")
 @app_commands.describe(prize="What is the drop prize?")
 async def start_drop(interaction: discord.Interaction, prize: str):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("You need Administrator permissions to start a drop!", ephemeral=True)
+        await interaction.response.send_message("❌ You need Administrator permissions to start a drop!", ephemeral=True)
         return
 
     embed = discord.Embed(
@@ -294,7 +383,6 @@ async def main():
         print("Error: DISCORD_TOKEN environment variable is missing!")
         return
 
-    # Start Web Server & Bot concurrently
     await start_web_server()
     await bot.start(TOKEN)
 
