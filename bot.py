@@ -113,7 +113,7 @@ def parse_duration(time_str: str) -> int:
     elif unit == 'd':
         return amount * 86400
     else:
-        return amount # Default to seconds if 's' or no unit is provided
+        return amount # Default to seconds
 
 
 class GiveawayView(discord.ui.View):
@@ -205,6 +205,19 @@ class DropView(discord.ui.View):
         await interaction.message.edit(embed=embed, view=self)
         await interaction.response.send_message(f"🎉 Congratulations {winner.mention}! You claimed the drop for **{self.prize}**!")
 
+        # --- DM THE WINNER ---
+        try:
+            await winner.send(f"⚡ Congratulations! You claimed the drop for **{self.prize}** in **{interaction.guild.name}**!")
+        except discord.Forbidden:
+            pass # Ignoring if user disabled DMs
+
+        # --- DM THE HOST ---
+        if self.host.id != winner.id:
+            try:
+                await self.host.send(f"⚡ Your drop for **{self.prize}** in **{interaction.guild.name}** was successfully claimed by {winner.mention}!")
+            except discord.Forbidden:
+                pass
+
 
 @bot.event
 async def on_ready():
@@ -256,6 +269,7 @@ async def start_giveaway(interaction: discord.Interaction, duration: str, prize:
 
     active_giveaways[msg.id] = set()
 
+    # Wait for the giveaway to finish
     await asyncio.sleep(seconds)
 
     participants_list = list(active_giveaways.get(msg.id, set()))
@@ -271,6 +285,13 @@ async def start_giveaway(interaction: discord.Interaction, duration: str, prize:
         ended_embed.set_footer(text="GiveawaySomething • Ended")
         await msg.edit(embed=ended_embed, view=None)
         await interaction.channel.send(f"The giveaway for **{prize}** ended, but nobody joined! 😢")
+        
+        # DM Host that nobody joined
+        try:
+            await interaction.user.send(f"📢 Your giveaway for **{prize}** in **{interaction.guild.name}** ended with no participants.")
+        except discord.Forbidden:
+            pass
+
     else:
         num_winners = min(winners, len(participants_list))
         winner_ids = random.sample(participants_list, num_winners)
@@ -284,6 +305,21 @@ async def start_giveaway(interaction: discord.Interaction, duration: str, prize:
         ended_embed.set_footer(text="GiveawaySomething • Ended")
         await msg.edit(embed=ended_embed, view=None)
         await interaction.channel.send(f"🎉 Congratulations {winner_mentions}! You won **{prize}**! 🎁")
+
+        # --- DM THE WINNERS ---
+        for w_id in winner_ids:
+            member = interaction.guild.get_member(w_id)
+            if member:
+                try:
+                    await member.send(f"🎉 Congratulations! You won the giveaway for **{prize}** in **{interaction.guild.name}**!")
+                except discord.Forbidden:
+                    pass
+
+        # --- DM THE HOST ---
+        try:
+            await interaction.user.send(f"📢 Your giveaway for **{prize}** in **{interaction.guild.name}** has ended!\n🏆 Winner(s): {winner_mentions}")
+        except discord.Forbidden:
+            pass
 
 
 @bot.tree.command(name="participants", description="See all participants of an active giveaway (Admin Only)")
