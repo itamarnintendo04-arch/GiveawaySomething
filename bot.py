@@ -7,7 +7,6 @@ import random
 import datetime
 import os
 import re
-import traceback
 
 # --- FAKE LANDING PAGE WEB SERVER ---
 HTML_PAGE = """
@@ -74,47 +73,68 @@ def parse_duration(time_str: str) -> int:
     else: return amount
 
 class GiveawayView(discord.ui.View):
-    def __init__(self, message_id: int):
+    def __init__(self, message_id: int, host_name: str):
         super().__init__(timeout=None)
         self.message_id = message_id
+        self.host_name = host_name
 
     @discord.ui.button(label="Join 🎉 (0)", style=discord.ButtonStyle.success, custom_id="join_giveaway_btn")
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        
         msg_id = interaction.message.id
         user_id = interaction.user.id
+        
         if msg_id not in active_giveaways:
-            await interaction.response.send_message("This giveaway has ended or reset!", ephemeral=True)
+            await interaction.followup.send("This giveaway has ended or reset!", ephemeral=True)
             return
+            
         participants = active_giveaways[msg_id]
         if user_id in participants:
-            await interaction.response.send_message("You are already in this giveaway!", ephemeral=True)
+            await interaction.followup.send("You are already in this giveaway!", ephemeral=True)
             return
 
         participants.add(user_id)
         button.label = f"Join 🎉 ({len(participants)})"
+        
         embed = interaction.message.embeds[0]
-        embed.set_footer(text=f"GiveawaySomething • {len(participants)} Participants • Hosted by ItamaRos", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
-        await interaction.message.edit(embed=embed, view=self)
-        await interaction.response.send_message("🎉 You have successfully joined the giveaway!", ephemeral=True)
+        embed.set_footer(text=f"GiveawaySomething • {len(participants)} Participants • Hosted by {self.host_name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
+        
+        try:
+            await interaction.message.edit(embed=embed, view=self)
+        except Exception:
+            pass
+            
+        await interaction.followup.send("🎉 You have successfully joined the giveaway!", ephemeral=True)
 
     @discord.ui.button(label="Leave ✖️", style=discord.ButtonStyle.danger, custom_id="leave_giveaway_btn")
     async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        
         msg_id = interaction.message.id
         user_id = interaction.user.id
+        
         if msg_id not in active_giveaways:
-            await interaction.response.send_message("This giveaway has ended or reset!", ephemeral=True)
+            await interaction.followup.send("This giveaway has ended or reset!", ephemeral=True)
             return
+            
         participants = active_giveaways[msg_id]
         if user_id not in participants:
-            await interaction.response.send_message("You haven't joined this giveaway yet!", ephemeral=True)
+            await interaction.followup.send("You haven't joined this giveaway yet!", ephemeral=True)
             return
 
         participants.remove(user_id)
         self.children[0].label = f"Join 🎉 ({len(participants)})"
+        
         embed = interaction.message.embeds[0]
-        embed.set_footer(text=f"GiveawaySomething • {len(participants)} Participants • Hosted by ItamaRos", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
-        await interaction.message.edit(embed=embed, view=self)
-        await interaction.response.send_message("You have left the giveaway.", ephemeral=True)
+        embed.set_footer(text=f"GiveawaySomething • {len(participants)} Participants • Hosted by {self.host_name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
+        
+        try:
+            await interaction.message.edit(embed=embed, view=self)
+        except Exception:
+            pass
+            
+        await interaction.followup.send("You have left the giveaway.", ephemeral=True)
 
 
 class DropView(discord.ui.View):
@@ -137,7 +157,7 @@ class DropView(discord.ui.View):
         button.style = discord.ButtonStyle.secondary
 
         embed = discord.Embed(title="⚡ DROP CLAIMED! ⚡", description=f"**Prize:** {self.prize}\n**Winner:** {winner.mention}\n**Hosted by:** {self.host.mention}", color=discord.Color.gold(), timestamp=datetime.datetime.now(datetime.timezone.utc))
-        embed.set_footer(text="GiveawaySomething • Drop Ended")
+        embed.set_footer(text=f"GiveawaySomething • Hosted by {self.host.name}")
 
         await interaction.message.edit(embed=embed, view=self)
         await interaction.response.send_message(f"🎉 Congratulations {winner.mention}! You claimed the drop for **{self.prize}**!")
@@ -161,7 +181,6 @@ async def on_ready():
     except Exception as e:
         print(f"Failed to sync commands: {e}")
 
-# Error handler for slash commands
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     print(f"Error in command: {error}")
@@ -174,10 +193,9 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 @bot.tree.command(name="giveaway", description="Start a timed giveaway! (Admin Only)")
 @app_commands.describe(duration="Time format: 30s, 10m, 2h, 1d", prize="What are you giving away?", winners="Number of winners (default: 1)")
-@app_commands.default_permissions(administrator=True) # חוסם אוטומטית אנשים בלי גישת מנהל
+@app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def start_giveaway(interaction: discord.Interaction, duration: str, prize: str, winners: int = 1):
-    # שורה זו פותרת את בעיית ה"לא ענה" על ידי תגובה מיידית לשרתי דיסקורד
     await interaction.response.defer(ephemeral=True)
 
     seconds = parse_duration(duration)
@@ -195,9 +213,8 @@ async def start_giveaway(interaction: discord.Interaction, duration: str, prize:
         timestamp=end_time
     )
     embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
-    embed.set_footer(text="GiveawaySomething • 0 Participants • Hosted by ItamaRos", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
+    embed.set_footer(text=f"GiveawaySomething • 0 Participants • Hosted by {interaction.user.name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
 
-    # בדיקה שיש לבוט הרשאה לשלוח בערוץ
     try:
         msg = await interaction.channel.send(embed=embed)
         await interaction.followup.send("✅ Giveaway created successfully!", ephemeral=True)
@@ -205,7 +222,7 @@ async def start_giveaway(interaction: discord.Interaction, duration: str, prize:
         await interaction.followup.send("❌ Error: I don't have permission to send messages or links in this channel. Check my roles!", ephemeral=True)
         return
     
-    view = GiveawayView(msg.id)
+    view = GiveawayView(msg.id, interaction.user.name)
     await msg.edit(view=view)
     active_giveaways[msg.id] = set()
 
@@ -217,7 +234,7 @@ async def start_giveaway(interaction: discord.Interaction, duration: str, prize:
 
     if not participants_list:
         ended_embed = discord.Embed(title=f"🎉 {prize} (ENDED) 🎉", description=f"**Winner:** No participants registered.\n**Hosted by:** {interaction.user.mention}", color=discord.Color.red())
-        ended_embed.set_footer(text="GiveawaySomething • Ended")
+        ended_embed.set_footer(text=f"GiveawaySomething • Ended • Hosted by {interaction.user.name}")
         await msg.edit(embed=ended_embed, view=None)
         await interaction.channel.send(f"The giveaway for **{prize}** ended, but nobody joined! 😢")
         try:
@@ -230,7 +247,7 @@ async def start_giveaway(interaction: discord.Interaction, duration: str, prize:
         winner_mentions = ", ".join([f"<@{w_id}>" for w_id in winner_ids])
 
         ended_embed = discord.Embed(title=f"🎉 {prize} (ENDED) 🎉", description=f"🏆 **Winner(s):** {winner_mentions}\n👑 **Hosted by:** {interaction.user.mention}", color=discord.Color.gold())
-        ended_embed.set_footer(text="GiveawaySomething • Ended")
+        ended_embed.set_footer(text=f"GiveawaySomething • Ended • Hosted by {interaction.user.name}")
         await msg.edit(embed=ended_embed, view=None)
         await interaction.channel.send(f"🎉 Congratulations {winner_mentions}! You won **{prize}**! 🎁")
 
@@ -255,7 +272,7 @@ async def start_drop(interaction: discord.Interaction, prize: str):
     await interaction.response.defer(ephemeral=True)
     
     embed = discord.Embed(title="⚡ QUICK DROP! ⚡", description=f"**Prize:** {prize}\n**Hosted by:** {interaction.user.mention}\n\nFirst person to click **CLAIM DROP!** wins!", color=discord.Color.blue())
-    embed.set_footer(text="GiveawaySomething • Fast Drop")
+    embed.set_footer(text=f"GiveawaySomething • Fast Drop • Hosted by {interaction.user.name}")
 
     view = DropView(prize, interaction.user)
     try:
@@ -316,8 +333,8 @@ async def remove_participant(interaction: discord.Interaction, message_id: str, 
     try:
         msg = await interaction.channel.fetch_message(msg_id)
         embed = msg.embeds[0]
-        embed.set_footer(text=f"GiveawaySomething • {len(participants)} Participants • Hosted by ItamaRos", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
-        view = GiveawayView(msg_id)
+        embed.set_footer(text=f"GiveawaySomething • {len(participants)} Participants • Hosted by {interaction.user.name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
+        view = GiveawayView(msg_id, interaction.user.name)
         view.children[0].label = f"Join 🎉 ({len(participants)})"
         await msg.edit(embed=embed, view=view)
     except Exception:
