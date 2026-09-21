@@ -176,8 +176,10 @@ class DropView(discord.ui.View):
 @bot.event
 async def on_ready():
     try:
-        await bot.tree.sync()
-        print(f"Logged in as {bot.user.name} (GiveawaySomething) - Slash commands synced successfully!")
+        MY_GUILD = discord.Object(id=1539624474083856407)
+        bot.tree.copy_global_to(guild=MY_GUILD)
+        await bot.tree.sync(guild=MY_GUILD)
+        print(f"Logged in as {bot.user.name} - Slash commands synced instantly to your server!")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
 
