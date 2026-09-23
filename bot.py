@@ -50,15 +50,31 @@ async def start_web_server():
     print(f"Web server started on port {port}")
 
 
+# --- DISCORD BOT CLASS WITH GRACEFUL SHUTDOWN ---
+class GiveawayBot(commands.Bot):
+    async def close(self):
+        print("Render is updating/restarting! Updating bot status before shutdown...")
+        try:
+            # Update status before Render shuts down the server
+            await self.change_presence(
+                status=discord.Status.dnd,
+                activity=discord.CustomActivity(name="⏳ Server update in progress, please wait...")
+            )
+            await asyncio.sleep(2)  # Give Discord time to update presence
+        except Exception as e:
+            print(f"Failed to update status on shutdown: {e}")
+        await super().close()
+
+
 # --- DISCORD BOT SETUP ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = GiveawayBot(command_prefix="!", intents=intents)
 
-# Active giveaways store: message_id -> set of user_ids
+# Active giveaways store: message_id -> {"prize": str, "participants": set}
 active_giveaways = {}
 
 def parse_duration(time_str: str) -> int:
@@ -89,7 +105,7 @@ class GiveawayView(discord.ui.View):
             await interaction.followup.send("This giveaway has ended or reset!", ephemeral=True)
             return
             
-        participants = active_giveaways[msg_id]
+        participants = active_giveaways[msg_id]["participants"]
         if user_id in participants:
             await interaction.followup.send("You are already in this giveaway!", ephemeral=True)
             return
@@ -118,7 +134,7 @@ class GiveawayView(discord.ui.View):
             await interaction.followup.send("This giveaway has ended or reset!", ephemeral=True)
             return
             
-        participants = active_giveaways[msg_id]
+        participants = active_giveaways[msg_id]["participants"]
         if user_id not in participants:
             await interaction.followup.send("You haven't joined this giveaway yet!", ephemeral=True)
             return
@@ -173,13 +189,71 @@ class DropView(discord.ui.View):
                 pass
 
 
+# --- SELECT MENU FOR PARTICIPANTS ---
+class GiveawaySelect(discord.ui.Select):
+    def __init__(self, giveaways: dict):
+        options = []
+        for msg_id, data in giveaways.items():
+            prize_name = data["prize"]
+            count = len(data["participants"])
+            label = f"{prize_name[:80]} ({count} participants)"
+            options.append(discord.SelectOption(label=label, value=str(msg_id)))
+        
+        super().__init__(placeholder="Select a giveaway to view participants...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        msg_id = int(self.values[0])
+        if msg_id not in active_giveaways:
+            await interaction.followup.send("❌ This giveaway has ended or does not exist!", ephemeral=True)
+            return
+
+        data = active_giveaways[msg_id]
+        participants = data["participants"]
+        prize = data["prize"]
+
+        if not participants:
+            await interaction.followup.send(f"There are currently no registered participants for **{prize}**.", ephemeral=True)
+            return
+
+        names_list = []
+        for u_id in participants:
+            member = interaction.guild.get_member(u_id)
+            if member:
+                names_list.append(f"• {member.display_name} (`{member.name}`)")
+            else:
+                names_list.append(f"• User ID `{u_id}`")
+
+        users_str = "\n".join(names_list)
+        if len(users_str) > 4000:
+            users_str = users_str[:3900] + "\n... (too many participants to display completely)"
+
+        embed = discord.Embed(
+            title=f"📋 Giveaway Participants: {prize}",
+            description=f"**Total Participants:** {len(participants)}\n\n{users_str}",
+            color=discord.Color.blue()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class GiveawaySelectView(discord.ui.View):
+    def __init__(self, giveaways: dict):
+        super().__init__(timeout=60)
+        self.add_item(GiveawaySelect(giveaways))
+
+
 @bot.event
 async def on_ready():
     try:
-        MY_GUILD = discord.Object(id=1539624474083856407)
-        bot.tree.copy_global_to(guild=MY_GUILD)
-        await bot.tree.sync(guild=MY_GUILD)
-        print(f"Logged in as {bot.user.name} - Slash commands synced instantly to your server!")
+        # Global command sync across all servers where the bot is invited
+        await bot.tree.sync()
+        
+        # Reset presence status to ONLINE when update completes
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=discord.CustomActivity(name="🎉 Giveaways active!")
+        )
+        print(f"Logged in as {bot.user.name} - Global slash commands synced successfully!")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
 
@@ -221,18 +295,17 @@ async def start_giveaway(interaction: discord.Interaction, duration: str, prize:
         msg = await interaction.channel.send(embed=embed)
         await interaction.followup.send("✅ Giveaway created successfully!", ephemeral=True)
     except discord.Forbidden:
-        await interaction.followup.send("❌ Error: I don't have permission to send messages or links in this channel. Check my roles!", ephemeral=True)
+        await interaction.followup.send("❌ Error: I don't have permission to send messages in this channel.", ephemeral=True)
         return
     
     view = GiveawayView(msg.id, interaction.user.name)
     await msg.edit(view=view)
-    active_giveaways[msg.id] = set()
+    active_giveaways[msg.id] = {"prize": prize, "participants": set()}
 
     await asyncio.sleep(seconds)
 
-    participants_list = list(active_giveaways.get(msg.id, set()))
-    if msg.id in active_giveaways:
-        del active_giveaways[msg.id]
+    giveaway_data = active_giveaways.pop(msg.id, None)
+    participants_list = list(giveaway_data["participants"]) if giveaway_data else []
 
     if not participants_list:
         ended_embed = discord.Embed(title=f"🎉 {prize} (ENDED) 🎉", description=f"**Winner:** No participants registered.\n**Hosted by:** {interaction.user.mention}", color=discord.Color.red())
@@ -281,68 +354,52 @@ async def start_drop(interaction: discord.Interaction, prize: str):
         await interaction.channel.send(embed=embed, view=view)
         await interaction.followup.send("✅ Drop created successfully!", ephemeral=True)
     except discord.Forbidden:
-        await interaction.followup.send("❌ Error: I don't have permission to send messages or links in this channel.", ephemeral=True)
+        await interaction.followup.send("❌ Error: I don't have permission to send messages in this channel.", ephemeral=True)
 
 
-@bot.tree.command(name="participants", description="See all participants of an active giveaway (Admin Only)")
-@app_commands.describe(message_id="The ID of the giveaway message")
+@bot.tree.command(name="participants", description="See all participants of an active giveaway via menu (Admin Only)")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
-async def list_participants(interaction: discord.Interaction, message_id: str):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        msg_id = int(message_id)
-    except ValueError:
-        await interaction.followup.send("❌ Please enter a valid message ID!", ephemeral=True)
+async def list_participants(interaction: discord.Interaction):
+    if not active_giveaways:
+        await interaction.response.send_message("❌ There are currently no active giveaways in this server!", ephemeral=True)
         return
 
-    if msg_id not in active_giveaways:
-        await interaction.followup.send("❌ Giveaway not found or already ended!", ephemeral=True)
-        return
-
-    participants = active_giveaways[msg_id]
-    if not participants:
-        await interaction.followup.send("There are currently no participants in this giveaway.", ephemeral=True)
-        return
-
-    user_mentions = "\n".join([f"• <@{u_id}>" for u_id in participants])
-    embed = discord.Embed(title="📋 Giveaway Participants", description=f"**Total:** {len(participants)}\n\n{user_mentions}", color=discord.Color.blue())
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    view = GiveawaySelectView(active_giveaways)
+    await interaction.response.send_message("Select a giveaway from the menu below to view its participants:", view=view, ephemeral=True)
 
 
 @bot.tree.command(name="remove_participant", description="Remove a user from an active giveaway (Admin Only)")
-@app_commands.describe(message_id="The ID of the giveaway message", user="The user to remove")
+@app_commands.describe(user="The user to remove")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
-async def remove_participant(interaction: discord.Interaction, message_id: str, user: discord.Member):
+async def remove_participant(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.defer(ephemeral=True)
-    try:
-        msg_id = int(message_id)
-    except ValueError:
-        await interaction.followup.send("❌ Please enter a valid message ID!", ephemeral=True)
+    
+    if not active_giveaways:
+        await interaction.followup.send("❌ There are currently no active giveaways in this server!", ephemeral=True)
         return
 
-    if msg_id not in active_giveaways:
-        await interaction.followup.send("❌ Giveaway not found or already ended!", ephemeral=True)
-        return
+    found = False
+    for msg_id, data in active_giveaways.items():
+        if user.id in data["participants"]:
+            data["participants"].remove(user.id)
+            found = True
+            try:
+                msg = await interaction.channel.fetch_message(msg_id)
+                embed = msg.embeds[0]
+                embed.set_footer(text=f"GiveawaySomething • {len(data['participants'])} Participants • Hosted by {interaction.user.name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
+                view = GiveawayView(msg_id, interaction.user.name)
+                view.children[0].label = f"Join 🎉 ({len(data['participants'])})"
+                await msg.edit(embed=embed, view=view)
+            except Exception:
+                pass
+            break
 
-    participants = active_giveaways[msg_id]
-    if user.id not in participants:
-        await interaction.followup.send(f"❌ {user.mention} is not in this giveaway!", ephemeral=True)
-        return
-
-    participants.remove(user.id)
-    try:
-        msg = await interaction.channel.fetch_message(msg_id)
-        embed = msg.embeds[0]
-        embed.set_footer(text=f"GiveawaySomething • {len(participants)} Participants • Hosted by {interaction.user.name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
-        view = GiveawayView(msg_id, interaction.user.name)
-        view.children[0].label = f"Join 🎉 ({len(participants)})"
-        await msg.edit(embed=embed, view=view)
-    except Exception:
-        pass
-
-    await interaction.followup.send(f"✅ Successfully removed {user.mention} from the giveaway!", ephemeral=True)
+    if found:
+        await interaction.followup.send(f"✅ Successfully removed {user.mention} from the giveaway!", ephemeral=True)
+    else:
+        await interaction.followup.send(f"❌ {user.mention} is not registered in any active giveaway.", ephemeral=True)
 
 
 async def main():
