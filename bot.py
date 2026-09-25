@@ -1,175 +1,183 @@
-import discord
-from discord import app_commands
 import os
 import asyncio
 import random
-from datetime import datetime, timezone, timedelta
-import motor.motor_asyncio
+from datetime import datetime, timedelta, timezone
+import discord
+from discord.ext import commands, tasks
 from aiohttp import web
+from motor.motor_asyncio import AsyncIOMotorClient
 
-# משיכת משתני הסביבה (Secrets) מ-Render
-MONGO_URI = os.getenv("MONGO_URI")
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+# --- הגדרת שרת הדמה עבור Render ---
+async def handle(request):
+    return web.Response(text="Giveaway Bot is active and running!")
 
-# התחברות למסד הנתונים
-cluster = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
-db = cluster["giveaway_bot"]
-giveaways_col = db["giveaways"]
+app = web.Application()
+app.router.add_get("/", handle)
 
-class GiveawayClient(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-
-    async def setup_hook(self):
-        # הוספת כפתור ההגרלה התמידי כדי שיעבוד גם אחרי ריסטארט
-        self.add_view(GiveawayView())
-        # סנכרון פקודות הסלאש
-        await self.tree.sync()
-        # הפעלת שרת האינטרנט הפנימי בשביל Render (פורט 8080)
-        self.loop.create_task(start_dummy_server())
-        # הפעלת לולאת הרקע שבודקת מתי הגרלות מסתיימות
-        self.loop.create_task(check_giveaways_loop())
-
-client = GiveawayClient()
-
-# --- כפתור ההשתתפות הקבוע ---
-class GiveawayView(discord.ui.View):
-    def __init__(self):
-        # timeout=None קריטי כדי שהכפתור לא יפסיק לעבוד אף פעם
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="🎉 Join Giveaway", style=discord.ButtonStyle.green, custom_id="join_giveaway_button")
-    async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        msg_id = str(interaction.message.id)
-        user_id = interaction.user.id
-        
-        # חיפוש ההגרלה במונגו כדי לוודא שהיא פעילה
-        giveaway = await giveaways_col.find_one({"_id": msg_id, "status": "active"})
-        if not giveaway:
-            return await interaction.response.send_message("הגרלה זו הסתיימה או שהיא לא קיימת יותר.", ephemeral=True)
-            
-        # בדיקה אם המשתמש כבר משתתף
-        if user_id in giveaway.get("participants", []):
-            return await interaction.response.send_message("אתה כבר משתתף בהגרלה הזו! 🎉", ephemeral=True)
-            
-        # הוספת המשתמש למסד הנתונים
-        await giveaways_col.update_one({"_id": msg_id}, {"$push": {"participants": user_id}})
-        await interaction.response.send_message("נכנסת להגרלה בהצלחה! בהצלחה! 🎁", ephemeral=True)
-
-# --- פקודת התחלת הגרלה ---
-@client.tree.command(name="giveaway", description="Start a new giveaway")
-@app_commands.describe(prize="What is the prize?", duration_minutes="How many minutes will the giveaway run?", winners="How many winners?")
-async def giveaway(interaction: discord.Interaction, prize: str, duration_minutes: int, winners: int = 1):
-    # וידוא שיש למפעיל אישור לנהל אירועים
-    if not interaction.user.guild_permissions.manage_events:
-        return await interaction.response.send_message("You do not have permission to start giveaways.", ephemeral=True)
-
-    end_time = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
-    unix_time = int(end_time.timestamp())
-    
-    embed = discord.Embed(
-        title="🎉 GIVEAWAY STARTED 🎉", 
-        description=f"**Prize:** {prize}\n**Winners:** {winners}\n**Ends:** <t:{unix_time}:R>\n\nClick the button below to enter!", 
-        color=discord.Color.blue()
-    )
-    
-    await interaction.response.send_message("Giveaway is starting...", ephemeral=True)
-    message = await interaction.channel.send(embed=embed, view=GiveawayView())
-    
-    # שמירת נתוני ההגרלה במונגו
-    giveaway_data = {
-        "_id": str(message.id),
-        "channel_id": str(interaction.channel.id),
-        "prize": prize,
-        "winners_count": winners,
-        "end_time": end_time,
-        "status": "active",
-        "participants": []
-    }
-    await giveaways_col.insert_one(giveaway_data)
-
-# --- פקודת סיום הגרלה ידני (בכוח) ---
-@client.tree.command(name="force_end", description="Force end an active giveaway immediately")
-@app_commands.describe(message_id="The Message ID of the giveaway")
-async def force_end(interaction: discord.Interaction, message_id: str):
-    if not interaction.user.guild_permissions.manage_events:
-        return await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
-        
-    giveaway = await giveaways_col.find_one({"_id": message_id, "status": "active"})
-    if not giveaway:
-        return await interaction.response.send_message("Giveaway not found or it has already ended.", ephemeral=True)
-        
-    await interaction.response.send_message(f"Ending giveaway {message_id} immediately...", ephemeral=True)
-    await end_giveaway(giveaway)
-
-# --- הפעולה שמסיימת הגרלה ובוחרת מנצחים ---
-async def end_giveaway(giveaway):
-    msg_id = giveaway["_id"]
-    channel_id = int(giveaway["channel_id"])
-    participants = giveaway.get("participants", [])
-    winners_count = giveaway["winners_count"]
-    prize = giveaway["prize"]
-    
-    # עדכון סטטוס במונגו כדי שלא תיבחר פעמיים
-    await giveaways_col.update_one({"_id": msg_id}, {"$set": {"status": "ended"}})
-    
-    channel = client.get_channel(channel_id)
-    if not channel:
-        try:
-            channel = await client.fetch_channel(channel_id)
-        except:
-            return
-            
-    try:
-        message = await channel.fetch_message(int(msg_id))
-        
-        # בחירת מנצחים
-        if len(participants) == 0:
-            await channel.send(f"The giveaway for **{prize}** has ended, but nobody participated! 😢")
-        else:
-            actual_winners_count = min(winners_count, len(participants))
-            winners = random.sample(participants, actual_winners_count)
-            winners_mentions = ", ".join([f"<@{w}>" for w in winners])
-            
-            await channel.send(f"🎉 Congratulations {winners_mentions}! You won **{prize}**! 🎉\n[Jump to Giveaway]({message.jump_url})")
-        
-        # עדכון ההודעה המקורית (כיבוי כפתור וצבע אדום)
-        embed = message.embeds[0]
-        embed.title = "🎉 GIVEAWAY ENDED 🎉"
-        embed.color = discord.Color.red()
-        await message.edit(embed=embed, view=None) 
-        
-    except discord.NotFound:
-        pass
-
-# --- לולאת רקע אוטומטית שרצה כל הזמן ומחפשת הגרלות שנגמרו ---
-async def check_giveaways_loop():
-    await client.wait_until_ready()
-    while not client.is_closed():
-        now = datetime.now(timezone.utc)
-        # חיפוש הגרלות פעילות שהזמן שלהן קטן או שווה לעכשיו
-        cursor = giveaways_col.find({"status": "active", "end_time": {"$lte": now}})
-        async for giveaway in cursor:
-            await end_giveaway(giveaway)
-        await asyncio.sleep(15) # המתנה של 15 שניות בין בדיקה לבדיקה
-
-# --- פונקציות השרת המדומה כדי שרנדר יחשוב שזה אתר פעיל ---
-async def dummy_handler(request):
-    return web.Response(text="GiveawaySomething is Online!")
-
-async def start_dummy_server():
-    app = web.Application()
-    app.router.add_get('/', dummy_handler)
+async def start_web_server():
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    print(f"Dummy web server started on port {port}")
+
+# --- הגדרת חיבור ל-MongoDB ---
+MONGO_URI = os.getenv("MONGO_URI")
+db_client = AsyncIOMotorClient(MONGO_URI)
+db = db_client["giveaway_database"]
+giveaways_collection = db["giveaways"]
+
+# --- הגדרת הבוט של דיסקורד ---
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# --- תצוגת הכפתורים של ההגרלה ---
+class GiveawayView(discord.ui.View):
+    def __init__(self, message_id: int):
+        super().__init__(timeout=None)
+        self.message_id = message_id
+
+    @discord.ui.button(label="🎉 השתתף בהגרלה", style=discord.ButtonStyle.primary, custom_id="join_giveaway_button")
+    async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        giveaway = await giveaways_collection.find_one({"message_id": self.message_id})
+        
+        if not giveaway or not giveaway.get("active", False):
+            await interaction.response.send_message("ההגרלה הזו כבר הסתיימה או לא קיימת.", ephemeral=True)
+            return
+            
+        user_id = interaction.user.id
+        if user_id in giveaway.get("participants", []):
+            await interaction.response.send_message("אתה כבר משתתף בהגרלה הזו! בהצלחה! 🍀", ephemeral=True)
+            return
+
+        # הוספת המשתמש למסד הנתונים
+        await giveaways_collection.update_one(
+            {"message_id": self.message_id}, 
+            {"$push": {"participants": user_id}}
+        )
+        await interaction.response.send_message("נכנסת להגרלה בהצלחה! 🎉", ephemeral=True)
+
+# --- אירוע הדלקת הבוט ---
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    bot.add_view(GiveawayView(0)) # רישום תצוגת הכפתורים כדי שיעבדו גם אחרי ריסטארט
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash commands.")
+    except Exception as e:
+        print(f"Failed to sync commands: {e}")
+    
+    # הפעלת לולאת הבדיקה של ההגרלות
+    if not check_giveaways.is_running():
+        check_giveaways.start()
+
+# --- פקודות ההגרלה ---
+@bot.tree.command(name="gstart", description="התחל הגרלה חדשה")
+async def gstart(interaction: discord.Interaction, prize: str, duration_minutes: int, winners: int = 1):
+    end_time = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
+    
+    embed = discord.Embed(
+        title="🎉 הגרלה חדשה! 🎉", 
+        description=f"**פרס:** {prize}\n**מספר זוכים:** {winners}\n**מסתיימת ב:** <t:{int(end_time.timestamp())}:R>", 
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="לחץ על הכפתור למטה כדי להשתתף!")
+    
+    await interaction.response.send_message("ההגרלה מתחילה...", ephemeral=True)
+    msg = await interaction.channel.send(embed=embed)
+    
+    view = GiveawayView(message_id=msg.id)
+    await msg.edit(view=view)
+
+    # שמירת ההגרלה ב-MongoDB
+    await giveaways_collection.insert_one({
+        "message_id": msg.id,
+        "channel_id": msg.channel.id,
+        "prize": prize,
+        "winners_count": winners,
+        "end_time": end_time.timestamp(),
+        "participants": [],
+        "active": True
+    })
+
+@bot.tree.command(name="gend", description="סיים הגרלה באופן ידני")
+async def gend(interaction: discord.Interaction, message_id: str):
+    try:
+        msg_id = int(message_id)
+    except ValueError:
+        await interaction.response.send_message("נא להזין מספר מזהה (ID) תקין.", ephemeral=True)
+        return
+    
+    giveaway = await giveaways_collection.find_one({"message_id": msg_id, "active": True})
+    if not giveaway:
+        await interaction.response.send_message("לא נמצאה הגרלה פעילה עם ה-ID הזה.", ephemeral=True)
+        return
+    
+    await end_giveaway(giveaway)
+    await interaction.response.send_message("ההגרלה הסתיימה בהצלחה.", ephemeral=True)
+
+# --- פונקציות רקע לניהול הגרלות ---
+@tasks.loop(seconds=30)
+async def check_giveaways():
+    now = datetime.now(timezone.utc).timestamp()
+    cursor = giveaways_collection.find({"active": True, "end_time": {"$lte": now}})
+    async for giveaway in cursor:
+        await end_giveaway(giveaway)
+
+async def end_giveaway(giveaway):
+    msg_id = giveaway["message_id"]
+    channel_id = giveaway["channel_id"]
+    prize = giveaway["prize"]
+    winners_count = giveaway["winners_count"]
+    participants = giveaway.get("participants", [])
+
+    # עדכון מסד הנתונים שההגרלה הסתיימה
+    await giveaways_collection.update_one({"message_id": msg_id}, {"$set": {"active": False}})
+
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        return
+
+    try:
+        msg = await channel.fetch_message(msg_id)
+        # הסרת הכפתור מתיבת ההודעה
+        await msg.edit(view=None) 
+    except Exception:
+        pass
+
+    if len(participants) == 0:
+        await channel.send(f"ההגרלה על **{prize}** הסתיימה, אך אף אחד לא השתתף. 😢")
+        return
+    
+    # בחירת זוכים
+    actual_winners_count = min(winners_count, len(participants))
+    winner_ids = random.sample(participants, actual_winners_count)
+    winners_mentions = ", ".join([f"<@{uid}>" for uid in winner_ids])
+
+    embed = discord.Embed(
+        title="🎉 ההגרלה הסתיימה! 🎉", 
+        description=f"**פרס:** {prize}\n**זוכים:** {winners_mentions}", 
+        color=discord.Color.green()
+    )
+    await channel.send(content=f"מזל טוב {winners_mentions}! זכיתם ב-**{prize}**!", embed=embed)
+
+# --- נקודת כניסה ראשית המריצה הכל במקביל ---
+async def main():
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        print("Error: DISCORD_TOKEN environment variable not set!")
+        return
+
+    # הפעלת שרת ה-Web בצד הרקע עבור Render
+    await start_web_server()
+
+    # הפעלת הבוט של דיסקורד
+    async with bot:
+        await bot.start(token)
 
 if __name__ == "__main__":
-    if not DISCORD_TOKEN or not MONGO_URI:
-        print("CRITICAL ERROR: MISSING DISCORD_TOKEN OR MONGO_URI IN ENVIRONMENT VARIABLES")
-    else:
-        client.run(DISCORD_TOKEN)
+    asyncio.run(main())
