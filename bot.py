@@ -1,504 +1,175 @@
 import discord
-from discord.ext import commands, tasks
 from discord import app_commands
-from aiohttp import web
+import os
 import asyncio
 import random
-import datetime
-import os
-import re
-import json
+from datetime import datetime, timezone, timedelta
+import motor.motor_asyncio
+from aiohttp import web
 
-GIVEAWAYS_FILE = "giveaways.json"
+# משיכת משתני הסביבה (Secrets) מ-Render
+MONGO_URI = os.getenv("MONGO_URI")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# --- PERSISTENCE HELPERS ---
-def load_giveaways():
-    if os.path.exists(GIVEAWAYS_FILE):
-        try:
-            with open(GIVEAWAYS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Error loading giveaways: {e}")
-            return {}
-    return {}
+# התחברות למסד הנתונים
+cluster = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+db = cluster["giveaway_bot"]
+giveaways_col = db["giveaways"]
 
-def save_giveaways(data):
-    try:
-        with open(GIVEAWAYS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
-    except Exception as e:
-        print(f"Error saving giveaways: {e}")
+class GiveawayClient(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
 
-# Active giveaways store loaded from disk
-active_giveaways = load_giveaways()
+    async def setup_hook(self):
+        # הוספת כפתור ההגרלה התמידי כדי שיעבוד גם אחרי ריסטארט
+        self.add_view(GiveawayView())
+        # סנכרון פקודות הסלאש
+        await self.tree.sync()
+        # הפעלת שרת האינטרנט הפנימי בשביל Render (פורט 8080)
+        self.loop.create_task(start_dummy_server())
+        # הפעלת לולאת הרקע שבודקת מתי הגרלות מסתיימות
+        self.loop.create_task(check_giveaways_loop())
 
+client = GiveawayClient()
 
-# --- FAKE LANDING PAGE WEB SERVER ---
-HTML_PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GiveawaySomething Bot</title>
-    <style>
-        body { background-color: #0f172a; color: #ffffff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; text-align: center; }
-        .container { background: #1e293b; padding: 40px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); max-width: 400px; width: 90%; border: 1px solid #334155; }
-        h1 { color: #38bdf8; margin-bottom: 10px; }
-        p { color: #94a3b8; font-size: 1.1em; margin-bottom: 25px; }
-        .status { display: inline-block; padding: 8px 16px; background-color: #22c55e; color: #ffffff; border-radius: 20px; font-weight: bold; font-size: 0.9em; margin-bottom: 20px; }
-        .btn { display: inline-block; background-color: #5865F2; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🎉 GiveawaySomething</h1>
-        <div class="status">● Bot Status: ONLINE</div>
-        <p>The ultimate giveaway & quick-drop bot for your Discord server.</p>
-        <a href="#" class="btn">Add to Discord</a>
-    </div>
-</body>
-</html>
-"""
-
-async def handle_index(request):
-    return web.Response(text=HTML_PAGE, content_type='text/html')
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle_index)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"Web server started on port {port}")
-
-
-# --- DISCORD BOT CLASS WITH GRACEFUL SHUTDOWN ---
-class GiveawayBot(commands.Bot):
-    async def close(self):
-        print("Render is updating/restarting! Updating bot status before shutdown...")
-        try:
-            await self.change_presence(
-                status=discord.Status.dnd,
-                activity=discord.CustomActivity(name="⏳ Server update in progress, please wait...")
-            )
-            await asyncio.sleep(2)
-        except Exception as e:
-            print(f"Failed to update status on shutdown: {e}")
-        await super().close()
-
-
-# --- DISCORD BOT SETUP ---
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-intents.members = True
-
-bot = GiveawayBot(command_prefix="!", intents=intents)
-
-def parse_duration(time_str: str) -> int:
-    match = re.match(r"^(\d+)([smhd])?$", time_str.lower().strip())
-    if not match:
-        return -1
-    amount = int(match.group(1))
-    unit = match.group(2)
-    if unit == 'm': return amount * 60
-    elif unit == 'h': return amount * 3600
-    elif unit == 'd': return amount * 86400
-    else: return amount
-
-
-# --- PERSISTENT GIVEAWAY VIEW ---
+# --- כפתור ההשתתפות הקבוע ---
 class GiveawayView(discord.ui.View):
     def __init__(self):
+        # timeout=None קריטי כדי שהכפתור לא יפסיק לעבוד אף פעם
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Join 🎉", style=discord.ButtonStyle.success, custom_id="join_giveaway_btn")
+    @discord.ui.button(label="🎉 Join Giveaway", style=discord.ButtonStyle.green, custom_id="join_giveaway_button")
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        
-        msg_id_str = str(interaction.message.id)
-        
-        if msg_id_str not in active_giveaways:
-            await interaction.followup.send("This giveaway has ended or reset!", ephemeral=True)
-            return
-            
-        participants = active_giveaways[msg_id_str]["participants"]
+        msg_id = str(interaction.message.id)
         user_id = interaction.user.id
         
-        if user_id in participants:
-            await interaction.followup.send("You are already in this giveaway!", ephemeral=True)
-            return
-
-        participants.append(user_id)
-        save_giveaways(active_giveaways)
-        
-        host_name = active_giveaways[msg_id_str].get("host_name", "Unknown")
-        
-        new_view = GiveawayView()
-        new_view.children[0].label = f"Join 🎉 ({len(participants)})"
-        
-        embed = interaction.message.embeds[0]
-        embed.set_footer(text=f"GiveawaySomething • {len(participants)} Participants • Hosted by {host_name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
-        
-        try:
-            await interaction.message.edit(embed=embed, view=new_view)
-        except Exception:
-            pass
+        # חיפוש ההגרלה במונגו כדי לוודא שהיא פעילה
+        giveaway = await giveaways_col.find_one({"_id": msg_id, "status": "active"})
+        if not giveaway:
+            return await interaction.response.send_message("הגרלה זו הסתיימה או שהיא לא קיימת יותר.", ephemeral=True)
             
-        await interaction.followup.send("🎉 You have successfully joined the giveaway!", ephemeral=True)
-
-    @discord.ui.button(label="Leave ✖️", style=discord.ButtonStyle.danger, custom_id="leave_giveaway_btn")
-    async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        
-        msg_id_str = str(interaction.message.id)
-        
-        if msg_id_str not in active_giveaways:
-            await interaction.followup.send("This giveaway has ended or reset!", ephemeral=True)
-            return
+        # בדיקה אם המשתמש כבר משתתף
+        if user_id in giveaway.get("participants", []):
+            return await interaction.response.send_message("אתה כבר משתתף בהגרלה הזו! 🎉", ephemeral=True)
             
-        participants = active_giveaways[msg_id_str]["participants"]
-        user_id = interaction.user.id
-        
-        if user_id not in participants:
-            await interaction.followup.send("You haven't joined this giveaway yet!", ephemeral=True)
-            return
+        # הוספת המשתמש למסד הנתונים
+        await giveaways_col.update_one({"_id": msg_id}, {"$push": {"participants": user_id}})
+        await interaction.response.send_message("נכנסת להגרלה בהצלחה! בהצלחה! 🎁", ephemeral=True)
 
-        participants.remove(user_id)
-        save_giveaways(active_giveaways)
-        
-        host_name = active_giveaways[msg_id_str].get("host_name", "Unknown")
-        
-        new_view = GiveawayView()
-        new_view.children[0].label = f"Join 🎉 ({len(participants)})"
-        
-        embed = interaction.message.embeds[0]
-        embed.set_footer(text=f"GiveawaySomething • {len(participants)} Participants • Hosted by {host_name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
-        
-        try:
-            await interaction.message.edit(embed=embed, view=new_view)
-        except Exception:
-            pass
-            
-        await interaction.followup.send("You have left the giveaway.", ephemeral=True)
+# --- פקודת התחלת הגרלה ---
+@client.tree.command(name="giveaway", description="Start a new giveaway")
+@app_commands.describe(prize="What is the prize?", duration_minutes="How many minutes will the giveaway run?", winners="How many winners?")
+async def giveaway(interaction: discord.Interaction, prize: str, duration_minutes: int, winners: int = 1):
+    # וידוא שיש למפעיל אישור לנהל אירועים
+    if not interaction.user.guild_permissions.manage_events:
+        return await interaction.response.send_message("You do not have permission to start giveaways.", ephemeral=True)
 
-
-class DropView(discord.ui.View):
-    def __init__(self, prize: str, host: discord.User):
-        super().__init__(timeout=None)
-        self.prize = prize
-        self.host = host
-        self.claimed = False
-
-    @discord.ui.button(label="CLAIM DROP! ⚡", style=discord.ButtonStyle.success, custom_id="claim_drop_btn")
-    async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.claimed:
-            await interaction.response.send_message("This drop was already claimed!", ephemeral=True)
-            return
-
-        self.claimed = True
-        winner = interaction.user
-        button.disabled = True
-        button.label = "CLAIMED! 🎁"
-        button.style = discord.ButtonStyle.secondary
-
-        embed = discord.Embed(title="⚡ DROP CLAIMED! ⚡", description=f"**Prize:** {self.prize}\n**Winner:** {winner.mention}\n**Hosted by:** {self.host.mention}", color=discord.Color.gold(), timestamp=datetime.datetime.now(datetime.timezone.utc))
-        embed.set_footer(text=f"GiveawaySomething • Hosted by {self.host.name}")
-
-        await interaction.message.edit(embed=embed, view=self)
-        await interaction.response.send_message(f"🎉 Congratulations {winner.mention}! You claimed the drop for **{self.prize}**!")
-
-        try:
-            await winner.send(f"⚡ Congratulations! You claimed the drop for **{self.prize}** in **{interaction.guild.name}**!")
-        except discord.Forbidden:
-            pass
-        if self.host.id != winner.id:
-            try:
-                await self.host.send(f"⚡ Your drop for **{self.prize}** in **{interaction.guild.name}** was successfully claimed by {winner.mention}!")
-            except discord.Forbidden:
-                pass
-
-
-# --- BACKGROUND TASK TO CHECK ENDED GIVEAWAYS ---
-@tasks.loop(seconds=5)
-async def check_giveaways():
-    now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-    ended_ids = []
-
-    for msg_id_str, data in list(active_giveaways.items()):
-        if now_ts >= data["end_timestamp"]:
-            ended_ids.append(msg_id_str)
-
-    for msg_id_str in ended_ids:
-        data = active_giveaways.pop(msg_id_str, None)
-        if not data:
-            continue
-        save_giveaways(active_giveaways)
-
-        channel = bot.get_channel(data["channel_id"])
-        if not channel:
-            try:
-                channel = await bot.fetch_channel(data["channel_id"])
-            except Exception:
-                channel = None
-
-        prize = data["prize"]
-        participants_list = data["participants"]
-        winners_count = data.get("winners", 1)
-        host_id = data.get("host_id")
-        host_name = data.get("host_name", "Unknown")
-
-        msg = None
-        if channel:
-            try:
-                msg = await channel.fetch_message(int(msg_id_str))
-            except Exception:
-                msg = None
-
-        if not participants_list:
-            if msg:
-                ended_embed = discord.Embed(
-                    title=f"🎉 {prize} (ENDED) 🎉",
-                    description=f"**Winner:** No participants registered.\n**Hosted by:** <@{host_id}>",
-                    color=discord.Color.red()
-                )
-                ended_embed.set_footer(text=f"GiveawaySomething • Ended • Hosted by {host_name}")
-                await msg.edit(embed=ended_embed, view=None)
-            if channel:
-                await channel.send(f"The giveaway for **{prize}** ended, but nobody joined! 😢")
-        else:
-            num_winners = min(winners_count, len(participants_list))
-            winner_ids = random.sample(participants_list, num_winners)
-            winner_mentions = ", ".join([f"<@{w_id}>" for w_id in winner_ids])
-
-            if msg:
-                ended_embed = discord.Embed(
-                    title=f"🎉 {prize} (ENDED) 🎉",
-                    description=f"🏆 **Winner(s):** {winner_mentions}\n👑 **Hosted by:** <@{host_id}>",
-                    color=discord.Color.gold()
-                )
-                ended_embed.set_footer(text=f"GiveawaySomething • Ended • Hosted by {host_name}")
-                await msg.edit(embed=ended_embed, view=None)
-            if channel:
-                await channel.send(f"🎉 Congratulations {winner_mentions}! You won **{prize}**! 🎁")
-
-            for w_id in winner_ids:
-                if channel and channel.guild:
-                    member = channel.guild.get_member(w_id)
-                    if member:
-                        try:
-                            await member.send(f"🎉 Congratulations! You won the giveaway for **{prize}** in **{channel.guild.name}**!")
-                        except discord.Forbidden:
-                            pass
-
-
-# --- SELECT MENU FOR PARTICIPANTS ---
-class GiveawaySelect(discord.ui.Select):
-    def __init__(self, giveaways: dict):
-        options = []
-        for msg_id, data in giveaways.items():
-            prize_name = data["prize"]
-            count = len(data["participants"])
-            label = f"{prize_name[:80]} ({count} participants)"
-            options.append(discord.SelectOption(label=label, value=str(msg_id)))
-        
-        super().__init__(placeholder="Select a giveaway to view participants...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        msg_id = self.values[0]
-        if msg_id not in active_giveaways:
-            await interaction.followup.send("❌ This giveaway has ended or does not exist!", ephemeral=True)
-            return
-
-        data = active_giveaways[msg_id]
-        participants = data["participants"]
-        prize = data["prize"]
-
-        if not participants:
-            await interaction.followup.send(f"There are currently no registered participants for **{prize}**.", ephemeral=True)
-            return
-
-        names_list = []
-        for u_id in participants:
-            member = interaction.guild.get_member(u_id)
-            if member:
-                names_list.append(f"• {member.display_name} (`{member.name}`)")
-            else:
-                names_list.append(f"• User ID `{u_id}`")
-
-        users_str = "\n".join(names_list)
-        if len(users_str) > 4000:
-            users_str = users_str[:3900] + "\n... (too many participants to display completely)"
-
-        embed = discord.Embed(
-            title=f"📋 Giveaway Participants: {prize}",
-            description=f"**Total Participants:** {len(participants)}\n\n{users_str}",
-            color=discord.Color.blue()
-        )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-class GiveawaySelectView(discord.ui.View):
-    def __init__(self, giveaways: dict):
-        super().__init__(timeout=60)
-        self.add_item(GiveawaySelect(giveaways))
-
-
-@bot.event
-async def on_ready():
-    global active_giveaways
-    active_giveaways = load_giveaways()
+    end_time = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
+    unix_time = int(end_time.timestamp())
     
-    # Register persistent view so giveaway buttons survive bot restarts
-    bot.add_view(GiveawayView())
-
-    if not check_giveaways.is_running():
-        check_giveaways.start()
-
-    try:
-        await bot.tree.sync()
-        await bot.change_presence(
-            status=discord.Status.online,
-            activity=discord.CustomActivity(name="🎉 Giveaways active!")
-        )
-        print(f"Logged in as {bot.user.name} - Persistent giveaways loaded & commands synced!")
-    except Exception as e:
-        print(f"Failed to sync commands: {e}")
-
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    print(f"Error in command: {error}")
-    error_msg = f"❌ An error occurred: {error}"
-    if not interaction.response.is_done():
-        await interaction.response.send_message(error_msg, ephemeral=True)
-    else:
-        await interaction.followup.send(error_msg, ephemeral=True)
-
-
-@bot.tree.command(name="giveaway", description="Start a timed giveaway! (Admin Only)")
-@app_commands.describe(duration="Time format: 30s, 10m, 2h, 1d", prize="What are you giving away?", winners="Number of winners (default: 1)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def start_giveaway(interaction: discord.Interaction, duration: str, prize: str, winners: int = 1):
-    await interaction.response.defer(ephemeral=True)
-
-    seconds = parse_duration(duration)
-    if seconds <= 0:
-        await interaction.followup.send("❌ Invalid duration format! Use formats like `30s`, `10m`, `2h`, or `1d`.", ephemeral=True)
-        return
-
-    end_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
-    end_timestamp = int(end_time.timestamp())
-    timestamp_format = f"<t:{end_timestamp}:R>"
-
     embed = discord.Embed(
-        title=f"🎉 {prize} 🎉",
-        description=f"Click the **Join 🎉** button below to enter!\n\n⏱️ **Ends:** {timestamp_format}\n👑 **Hosted by:** {interaction.user.mention}\n🏆 **Winners:** {winners}",
-        color=discord.Color.green(),
-        timestamp=end_time
+        title="🎉 GIVEAWAY STARTED 🎉", 
+        description=f"**Prize:** {prize}\n**Winners:** {winners}\n**Ends:** <t:{unix_time}:R>\n\nClick the button below to enter!", 
+        color=discord.Color.blue()
     )
-    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
-    embed.set_footer(text=f"GiveawaySomething • 0 Participants • Hosted by {interaction.user.name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
-
-    try:
-        msg = await interaction.channel.send(embed=embed)
-        await interaction.followup.send("✅ Giveaway created successfully!", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.followup.send("❌ Error: I don't have permission to send messages in this channel.", ephemeral=True)
-        return
     
-    view = GiveawayView()
-    await msg.edit(view=view)
-
-    active_giveaways[str(msg.id)] = {
+    await interaction.response.send_message("Giveaway is starting...", ephemeral=True)
+    message = await interaction.channel.send(embed=embed, view=GiveawayView())
+    
+    # שמירת נתוני ההגרלה במונגו
+    giveaway_data = {
+        "_id": str(message.id),
+        "channel_id": str(interaction.channel.id),
         "prize": prize,
-        "channel_id": interaction.channel_id,
-        "guild_id": interaction.guild_id,
-        "host_id": interaction.user.id,
-        "host_name": interaction.user.name,
-        "end_timestamp": end_timestamp,
-        "winners": winners,
+        "winners_count": winners,
+        "end_time": end_time,
+        "status": "active",
         "participants": []
     }
-    save_giveaways(active_giveaways)
+    await giveaways_col.insert_one(giveaway_data)
 
+# --- פקודת סיום הגרלה ידני (בכוח) ---
+@client.tree.command(name="force_end", description="Force end an active giveaway immediately")
+@app_commands.describe(message_id="The Message ID of the giveaway")
+async def force_end(interaction: discord.Interaction, message_id: str):
+    if not interaction.user.guild_permissions.manage_events:
+        return await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+        
+    giveaway = await giveaways_col.find_one({"_id": message_id, "status": "active"})
+    if not giveaway:
+        return await interaction.response.send_message("Giveaway not found or it has already ended.", ephemeral=True)
+        
+    await interaction.response.send_message(f"Ending giveaway {message_id} immediately...", ephemeral=True)
+    await end_giveaway(giveaway)
 
-@bot.tree.command(name="drop", description="Start a drop giveaway! (Admin Only)")
-@app_commands.describe(prize="What is the drop prize?")
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def start_drop(interaction: discord.Interaction, prize: str):
-    await interaction.response.defer(ephemeral=True)
+# --- הפעולה שמסיימת הגרלה ובוחרת מנצחים ---
+async def end_giveaway(giveaway):
+    msg_id = giveaway["_id"]
+    channel_id = int(giveaway["channel_id"])
+    participants = giveaway.get("participants", [])
+    winners_count = giveaway["winners_count"]
+    prize = giveaway["prize"]
     
-    embed = discord.Embed(title="⚡ QUICK DROP! ⚡", description=f"**Prize:** {prize}\n**Hosted by:** {interaction.user.mention}\n\nFirst person to click **CLAIM DROP!** wins!", color=discord.Color.blue())
-    embed.set_footer(text=f"GiveawaySomething • Fast Drop • Hosted by {interaction.user.name}")
-
-    view = DropView(prize, interaction.user)
+    # עדכון סטטוס במונגו כדי שלא תיבחר פעמיים
+    await giveaways_col.update_one({"_id": msg_id}, {"$set": {"status": "ended"}})
+    
+    channel = client.get_channel(channel_id)
+    if not channel:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except:
+            return
+            
     try:
-        await interaction.channel.send(embed=embed, view=view)
-        await interaction.followup.send("✅ Drop created successfully!", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.followup.send("❌ Error: I don't have permission to send messages in this channel.", ephemeral=True)
+        message = await channel.fetch_message(int(msg_id))
+        
+        # בחירת מנצחים
+        if len(participants) == 0:
+            await channel.send(f"The giveaway for **{prize}** has ended, but nobody participated! 😢")
+        else:
+            actual_winners_count = min(winners_count, len(participants))
+            winners = random.sample(participants, actual_winners_count)
+            winners_mentions = ", ".join([f"<@{w}>" for w in winners])
+            
+            await channel.send(f"🎉 Congratulations {winners_mentions}! You won **{prize}**! 🎉\n[Jump to Giveaway]({message.jump_url})")
+        
+        # עדכון ההודעה המקורית (כיבוי כפתור וצבע אדום)
+        embed = message.embeds[0]
+        embed.title = "🎉 GIVEAWAY ENDED 🎉"
+        embed.color = discord.Color.red()
+        await message.edit(embed=embed, view=None) 
+        
+    except discord.NotFound:
+        pass
 
+# --- לולאת רקע אוטומטית שרצה כל הזמן ומחפשת הגרלות שנגמרו ---
+async def check_giveaways_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        now = datetime.now(timezone.utc)
+        # חיפוש הגרלות פעילות שהזמן שלהן קטן או שווה לעכשיו
+        cursor = giveaways_col.find({"status": "active", "end_time": {"$lte": now}})
+        async for giveaway in cursor:
+            await end_giveaway(giveaway)
+        await asyncio.sleep(15) # המתנה של 15 שניות בין בדיקה לבדיקה
 
-@bot.tree.command(name="participants", description="See all participants of an active giveaway via menu (Admin Only)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def list_participants(interaction: discord.Interaction):
-    if not active_giveaways:
-        await interaction.response.send_message("❌ There are currently no active giveaways in this server!", ephemeral=True)
-        return
+# --- פונקציות השרת המדומה כדי שרנדר יחשוב שזה אתר פעיל ---
+async def dummy_handler(request):
+    return web.Response(text="GiveawaySomething is Online!")
 
-    view = GiveawaySelectView(active_giveaways)
-    await interaction.response.send_message("Select a giveaway from the menu below to view its participants:", view=view, ephemeral=True)
-
-
-@bot.tree.command(name="remove_participant", description="Remove a user from an active giveaway (Admin Only)")
-@app_commands.describe(user="The user to remove")
-@app_commands.default_permissions(administrator=True)
-@app_commands.guild_only()
-async def remove_participant(interaction: discord.Interaction, user: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-    
-    if not active_giveaways:
-        await interaction.followup.send("❌ There are currently no active giveaways in this server!", ephemeral=True)
-        return
-
-    found = False
-    for msg_id_str, data in active_giveaways.items():
-        if user.id in data["participants"]:
-            data["participants"].remove(user.id)
-            save_giveaways(active_giveaways)
-            found = True
-            try:
-                msg = await interaction.channel.fetch_message(int(msg_id_str))
-                embed = msg.embeds[0]
-                embed.set_footer(text=f"GiveawaySomething • {len(data['participants'])} Participants • Hosted by {data.get('host_name', 'Unknown')}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
-                view = GiveawayView()
-                view.children[0].label = f"Join 🎉 ({len(data['participants'])})"
-                await msg.edit(embed=embed, view=view)
-            except Exception:
-                pass
-            break
-
-    if found:
-        await interaction.followup.send(f"✅ Successfully removed {user.mention} from the giveaway!", ephemeral=True)
-    else:
-        await interaction.followup.send(f"❌ {user.mention} is not registered in any active giveaway.", ephemeral=True)
-
-
-async def main():
-    TOKEN = os.getenv("DISCORD_TOKEN")
-    if not TOKEN:
-        print("Error: DISCORD_TOKEN environment variable is missing!")
-        return
-
-    await start_web_server()
-    await bot.start(TOKEN)
+async def start_dummy_server():
+    app = web.Application()
+    app.router.add_get('/', dummy_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if not DISCORD_TOKEN or not MONGO_URI:
+        print("CRITICAL ERROR: MISSING DISCORD_TOKEN OR MONGO_URI IN ENVIRONMENT VARIABLES")
+    else:
+        client.run(DISCORD_TOKEN)
