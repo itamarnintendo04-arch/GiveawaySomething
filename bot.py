@@ -34,7 +34,7 @@ intents.message_content = True
 intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- Giveaway View (Buttons) ---
+# --- Regular Giveaway View (Timed) ---
 class GiveawayView(discord.ui.View):
     def __init__(self, message_id: int):
         super().__init__(timeout=None)
@@ -53,18 +53,54 @@ class GiveawayView(discord.ui.View):
             await interaction.response.send_message("You are already participating in this giveaway! Good luck! 🍀", ephemeral=True)
             return
 
-        # Add user to database
         await giveaways_collection.update_one(
             {"message_id": self.message_id}, 
             {"$push": {"participants": user_id}}
         )
         await interaction.response.send_message("You have successfully entered the giveaway! 🎉", ephemeral=True)
 
+# --- Drop View (First Click Wins) ---
+class DropView(discord.ui.View):
+    def __init__(self, message_id: int):
+        super().__init__(timeout=None)
+        self.message_id = message_id
+
+    @discord.ui.button(label="⚡ Claim Drop", style=discord.ButtonStyle.success, custom_id="claim_drop_button")
+    async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Atomic check-and-update to ensure only the very first click wins
+        giveaway = await giveaways_collection.find_one_and_update(
+            {"message_id": self.message_id, "active": True},
+            {"$set": {"active": False, "winner": interaction.user.id}}
+        )
+        
+        if not giveaway:
+            await interaction.response.send_message("Too late! This drop has already been claimed by someone else. 😢", ephemeral=True)
+            return
+
+        prize = giveaway["prize"]
+        
+        # Disable button
+        for child in self.children:
+            child.disabled = True
+        
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+        embed = discord.Embed(
+            title="⚡ Drop Claimed! ⚡",
+            description=f"**Prize:** {prize}\n**Winner:** {interaction.user.mention}",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(content=f"Congratulations {interaction.user.mention}! You successfully claimed **{prize}**! 🎉", embed=embed)
+
 # --- Bot Ready Event ---
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     bot.add_view(GiveawayView(0))
+    bot.add_view(DropView(0))
     
     if not check_giveaways.is_running():
         check_giveaways.start()
@@ -81,8 +117,8 @@ async def sync(ctx):
         await ctx.send(f"Failed to sync commands: {e}")
 
 # --- Giveaway Commands ---
-@bot.tree.command(name="gstart", description="Start a new giveaway")
-async def gstart(interaction: discord.Interaction, prize: str, duration_minutes: int, winners: int = 1):
+@bot.tree.command(name="giveaway", description="Start a new timed giveaway")
+async def giveaway(interaction: discord.Interaction, prize: str, duration_minutes: int, winners: int = 1):
     end_time = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
     
     embed = discord.Embed(
@@ -98,7 +134,6 @@ async def gstart(interaction: discord.Interaction, prize: str, duration_minutes:
     view = GiveawayView(message_id=msg.id)
     await msg.edit(view=view)
 
-    # Save to MongoDB
     await giveaways_collection.insert_one({
         "message_id": msg.id,
         "channel_id": msg.channel.id,
@@ -106,46 +141,38 @@ async def gstart(interaction: discord.Interaction, prize: str, duration_minutes:
         "winners_count": winners,
         "end_time": end_time.timestamp(),
         "participants": [],
-        "active": True
+        "active": True,
+        "type": "giveaway"
     })
 
-@bot.tree.command(name="gend", description="Manually end a giveaway")
-async def gend(interaction: discord.Interaction, message_id: str):
-    try:
-        msg_id = int(message_id)
-    except ValueError:
-        await interaction.response.send_message("Please enter a valid message ID.", ephemeral=True)
-        return
+@bot.tree.command(name="drop", description="Drop an item - the first person to click wins instantly!")
+async def drop(interaction: discord.Interaction, prize: str):
+    embed = discord.Embed(
+        title="⚡ Item Drop! ⚡", 
+        description=f"**Prize:** {prize}\n\nFirst person to click the button below wins it instantly!", 
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text="Be quick! Only one winner!")
     
-    giveaway = await giveaways_collection.find_one({"message_id": msg_id, "active": True})
-    if not giveaway:
-        await interaction.response.send_message("No active giveaway found with this ID.", ephemeral=True)
-        return
+    await interaction.response.send_message("Drop is starting...", ephemeral=True)
+    msg = await interaction.channel.send(embed=embed)
     
-    await end_giveaway(giveaway)
-    await interaction.response.send_message("Giveaway ended successfully.", ephemeral=True)
+    view = DropView(message_id=msg.id)
+    await msg.edit(view=view)
 
-@bot.tree.command(name="force-end", description="Force end an active giveaway immediately")
-async def force_end(interaction: discord.Interaction, message_id: str):
-    try:
-        msg_id = int(message_id)
-    except ValueError:
-        await interaction.response.send_message("Please enter a valid message ID.", ephemeral=True)
-        return
-    
-    giveaway = await giveaways_collection.find_one({"message_id": msg_id, "active": True})
-    if not giveaway:
-        await interaction.response.send_message("No active giveaway found with this ID.", ephemeral=True)
-        return
-    
-    await end_giveaway(giveaway)
-    await interaction.response.send_message("Giveaway was force-ended successfully.", ephemeral=True)
+    await giveaways_collection.insert_one({
+        "message_id": msg.id,
+        "channel_id": msg.channel.id,
+        "prize": prize,
+        "active": True,
+        "type": "drop"
+    })
 
-# --- Background Task ---
+# --- Background Task for Timed Giveaways ---
 @tasks.loop(seconds=30)
 async def check_giveaways():
     now = datetime.now(timezone.utc).timestamp()
-    cursor = giveaways_collection.find({"active": True, "end_time": {"$lte": now}})
+    cursor = giveaways_collection.find({"active": True, "type": "giveaway", "end_time": {"$lte": now}})
     async for giveaway in cursor:
         await end_giveaway(giveaway)
 
