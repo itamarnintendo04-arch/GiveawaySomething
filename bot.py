@@ -72,14 +72,14 @@ async def on_ready():
     if not check_giveaways.is_running():
         check_giveaways.start()
 
-# --- Manual Sync Command for Public Bot (Owner Only) ---
+# --- Manual Sync Command for Public Bot (Admin Only) ---
 @bot.command()
-@commands.is_owner()
+@commands.has_permissions(administrator=True)
 async def sync(ctx):
     """Syncs slash commands globally. Run this only when you add/change commands."""
     try:
         synced = await bot.tree.sync()
-        await ctx.send(f"Success! Synced {len(synced)} slash commands globally.")
+        await ctx.send(f"Success! Synced {len(synced)} slash commands.")
     except Exception as e:
         await ctx.send(f"Failed to sync commands: {e}")
 
