@@ -7,6 +7,7 @@ import random
 import datetime
 import os
 import re
+import certifi
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 
@@ -54,7 +55,7 @@ async def start_web_server():
 
 # --- MONGODB SETUP ---
 MONGO_URI = os.getenv("MONGO_URI")
-db_client = AsyncIOMotorClient(MONGO_URI)
+db_client = AsyncIOMotorClient(MONGO_URI, tlsCAFile=certifi.where())
 db = db_client["giveaway_database"]
 giveaways_collection = db["giveaways"]
 
@@ -161,7 +162,6 @@ async def process_giveaway_end(message_id: int, bot_instance: commands.Bot, forc
             announcement += f"\n*(Giveaway was force-ended early by {force_ended_by.mention})*"
         await channel.send(announcement)
         
-        # שליחת הודעות פרטיות לזוכים
         for w_id in winner_ids:
             member = channel.guild.get_member(w_id)
             if member:
@@ -170,7 +170,6 @@ async def process_giveaway_end(message_id: int, bot_instance: commands.Bot, forc
                 except discord.Forbidden:
                     pass
         
-        # שליחת הודעה פרטית למארח ההגרלה
         try:
             host = bot_instance.get_user(host_id) or await bot_instance.fetch_user(host_id)
             await host.send(f"📢 Your giveaway for **{prize}** in **{channel.guild.name}** has ended!\n🏆 Winner(s): {winner_mentions}")
@@ -283,7 +282,6 @@ class DropView(discord.ui.View):
         await interaction.message.edit(embed=embed, view=self)
         await interaction.response.send_message(f"🎉 Congratulations {winner.mention}! You claimed the drop for **{self.prize}**!")
 
-        # שליחת הודעות פרטיות בדרופ
         try:
             await winner.send(f"⚡ Congratulations! You claimed the drop for **{self.prize}** in **{interaction.guild.name}**!")
         except discord.Forbidden:
