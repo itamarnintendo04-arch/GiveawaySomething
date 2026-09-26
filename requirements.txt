@@ -1,5 +1,5 @@
 discord.py
-motor
 aiohttp
-dnspython
-
+motor
+pymongo
+certifi
