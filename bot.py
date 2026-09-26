@@ -66,9 +66,6 @@ async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     bot.add_view(GiveawayView(0))
     
-    # Sync is completely removed from on_ready to prevent 429 bans on public bots.
-    # Use the !sync command below manually in Discord to update slash commands.
-    
     if not check_giveaways.is_running():
         check_giveaways.start()
 
@@ -127,6 +124,22 @@ async def gend(interaction: discord.Interaction, message_id: str):
     
     await end_giveaway(giveaway)
     await interaction.response.send_message("Giveaway ended successfully.", ephemeral=True)
+
+@bot.tree.command(name="force-end", description="Force end an active giveaway immediately")
+async def force_end(interaction: discord.Interaction, message_id: str):
+    try:
+        msg_id = int(message_id)
+    except ValueError:
+        await interaction.response.send_message("Please enter a valid message ID.", ephemeral=True)
+        return
+    
+    giveaway = await giveaways_collection.find_one({"message_id": msg_id, "active": True})
+    if not giveaway:
+        await interaction.response.send_message("No active giveaway found with this ID.", ephemeral=True)
+        return
+    
+    await end_giveaway(giveaway)
+    await interaction.response.send_message("Giveaway was force-ended successfully.", ephemeral=True)
 
 # --- Background Task ---
 @tasks.loop(seconds=30)
