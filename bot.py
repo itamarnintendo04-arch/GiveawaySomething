@@ -78,7 +78,6 @@ class GiveawayBot(commands.Bot):
 
     @tasks.loop(minutes=1)
     async def cleanup_missed_giveaways(self):
-        """Catches any giveaways that ended while the bot was restarting"""
         now = datetime.datetime.now(datetime.timezone.utc).timestamp()
         cursor = giveaways_collection.find({"active": True, "end_time": {"$lte": now}})
         async for giveaway in cursor:
@@ -142,6 +141,12 @@ async def process_giveaway_end(message_id: int, bot_instance: commands.Bot, forc
         ended_embed.set_footer(text=f"GiveawaySomething • Ended • Hosted by {host_name}")
         await msg.edit(embed=ended_embed, view=None)
         await channel.send(f"The giveaway for **{prize}** ended, but nobody joined! 😢")
+        
+        try:
+            host = bot_instance.get_user(host_id) or await bot_instance.fetch_user(host_id)
+            await host.send(f"📢 Your giveaway for **{prize}** in **{channel.guild.name}** ended with no participants.")
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
     else:
         num_winners = min(winners_count, len(participants_list))
         winner_ids = random.sample(participants_list, num_winners)
@@ -155,6 +160,22 @@ async def process_giveaway_end(message_id: int, bot_instance: commands.Bot, forc
         if force_ended_by:
             announcement += f"\n*(Giveaway was force-ended early by {force_ended_by.mention})*"
         await channel.send(announcement)
+        
+        # שליחת הודעות פרטיות לזוכים
+        for w_id in winner_ids:
+            member = channel.guild.get_member(w_id)
+            if member:
+                try:
+                    await member.send(f"🎉 Congratulations! You won the giveaway for **{prize}** in **{channel.guild.name}**!")
+                except discord.Forbidden:
+                    pass
+        
+        # שליחת הודעה פרטית למארח ההגרלה
+        try:
+            host = bot_instance.get_user(host_id) or await bot_instance.fetch_user(host_id)
+            await host.send(f"📢 Your giveaway for **{prize}** in **{channel.guild.name}** has ended!\n🏆 Winner(s): {winner_mentions}")
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
 
     return True
 
@@ -262,6 +283,18 @@ class DropView(discord.ui.View):
         await interaction.message.edit(embed=embed, view=self)
         await interaction.response.send_message(f"🎉 Congratulations {winner.mention}! You claimed the drop for **{self.prize}**!")
 
+        # שליחת הודעות פרטיות בדרופ
+        try:
+            await winner.send(f"⚡ Congratulations! You claimed the drop for **{self.prize}** in **{interaction.guild.name}**!")
+        except discord.Forbidden:
+            pass
+            
+        if self.host.id != winner.id:
+            try:
+                await self.host.send(f"⚡ Your drop for **{self.prize}** in **{interaction.guild.name}** was successfully claimed by {winner.mention}!")
+            except discord.Forbidden:
+                pass
+
 
 # --- SELECT MENUS ---
 class GiveawaySelect(discord.ui.Select):
@@ -330,6 +363,57 @@ class ForceEndSelect(discord.ui.Select):
             await interaction.followup.send("✅ Giveaway has been force-ended successfully!", ephemeral=True)
         else:
             await interaction.followup.send("❌ Failed to end giveaway. It might have already ended.", ephemeral=True)
+
+
+# --- REMOVE PARTICIPANT 2-STEP MENUS ---
+class RemoveParticipantUserSelect(discord.ui.UserSelect):
+    def __init__(self, message_id: int, prize: str):
+        super().__init__(placeholder=f"Select user to remove from {prize[:50]}...", min_values=1, max_values=1)
+        self.giveaway_message_id = message_id
+        self.prize = prize
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        user = self.values[0]
+        
+        updated = await giveaways_collection.find_one_and_update(
+            {"message_id": self.giveaway_message_id, "active": True, "participants": user.id},
+            {"$pull": {"participants": user.id}},
+            return_document=ReturnDocument.AFTER
+        )
+        
+        if updated:
+            try:
+                channel = bot.get_channel(updated["channel_id"])
+                msg = await channel.fetch_message(updated["message_id"])
+                embed = msg.embeds[0]
+                embed.set_footer(text=f"GiveawaySomething • {len(updated['participants'])} Participants • Hosted by {updated['host_name']}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
+                view = GiveawayView(updated["message_id"], updated["host_name"])
+                view.children[0].label = f"Join 🎉 ({len(updated['participants'])})"
+                await msg.edit(embed=embed, view=view)
+            except Exception:
+                pass
+            
+            await interaction.followup.send(f"✅ Successfully removed {user.mention} from **{self.prize}**!", ephemeral=True)
+        else:
+            await interaction.followup.send(f"❌ {user.mention} is not registered in this giveaway.", ephemeral=True)
+
+class RemoveParticipantGiveawaySelect(discord.ui.Select):
+    def __init__(self, giveaways_list):
+        options = []
+        for g in giveaways_list:
+            label = f"{g['prize'][:90]}"
+            options.append(discord.SelectOption(label=label, value=str(g["message_id"])))
+        super().__init__(placeholder="Step 1: Select a giveaway...", min_values=1, max_values=1, options=options)
+        self.giveaways_list = giveaways_list
+
+    async def callback(self, interaction: discord.Interaction):
+        msg_id = int(self.values[0])
+        prize = next((g["prize"] for g in self.giveaways_list if g["message_id"] == msg_id), "Giveaway")
+        
+        view = discord.ui.View(timeout=60)
+        view.add_item(RemoveParticipantUserSelect(msg_id, prize))
+        await interaction.response.edit_message(content=f"Step 2: Select the user to remove from **{prize}**:", view=view)
 
 
 class DynamicSelectView(discord.ui.View):
@@ -408,10 +492,7 @@ async def start_giveaway(interaction: discord.Interaction, duration: str, prize:
         "host_name": interaction.user.name
     })
 
-    # Wait for the duration
     await asyncio.sleep(seconds)
-    
-    # Process the end (will automatically do nothing if it was force-ended)
     await process_giveaway_end(msg.id, bot)
 
 
@@ -464,33 +545,19 @@ async def force_end(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="remove_participant", description="Remove a user from an active giveaway (Admin Only)")
-@app_commands.describe(user="The user to remove")
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
-async def remove_participant(interaction: discord.Interaction, user: discord.Member):
-    await interaction.response.defer(ephemeral=True)
+async def remove_participant_cmd(interaction: discord.Interaction):
+    cursor = giveaways_collection.find({"active": True, "guild_id": interaction.guild.id})
+    active_list = await cursor.to_list(length=25)
     
-    updated = await giveaways_collection.find_one_and_update(
-        {"active": True, "guild_id": interaction.guild.id, "participants": user.id},
-        {"$pull": {"participants": user.id}},
-        return_document=ReturnDocument.AFTER
-    )
-    
-    if updated:
-        try:
-            channel = bot.get_channel(updated["channel_id"])
-            msg = await channel.fetch_message(updated["message_id"])
-            embed = msg.embeds[0]
-            embed.set_footer(text=f"GiveawaySomething • {len(updated['participants'])} Participants • Hosted by {updated['host_name']}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
-            view = GiveawayView(updated["message_id"], updated["host_name"])
-            view.children[0].label = f"Join 🎉 ({len(updated['participants'])})"
-            await msg.edit(embed=embed, view=view)
-        except Exception:
-            pass
-        
-        await interaction.followup.send(f"✅ Successfully removed {user.mention} from the giveaway: **{updated['prize']}**", ephemeral=True)
-    else:
-        await interaction.followup.send(f"❌ {user.mention} is not registered in any active giveaway.", ephemeral=True)
+    if not active_list:
+        await interaction.response.send_message("❌ There are currently no active giveaways in this server!", ephemeral=True)
+        return
+
+    view = discord.ui.View(timeout=60)
+    view.add_item(RemoveParticipantGiveawaySelect(active_list))
+    await interaction.response.send_message("⚠️ Select a giveaway from the menu below first:", view=view, ephemeral=True)
 
 
 async def main():
