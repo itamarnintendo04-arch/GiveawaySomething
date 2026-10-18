@@ -180,53 +180,17 @@ async def process_giveaway_end(message_id: int, bot_instance: commands.Bot, forc
 
 
 # --- VIEWS & COMPONENTS ---
-class GiveawayView(discord.ui.View):
+class LeaveView(discord.ui.View):
     def __init__(self, message_id: int, host_name: str):
         super().__init__(timeout=None)
         self.message_id = message_id
         self.host_name = host_name
 
-    @discord.ui.button(label="Join 🎉 (0)", style=discord.ButtonStyle.success, custom_id="join_giveaway_btn")
-    async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        user_id = interaction.user.id
-        
-        giveaway = await giveaways_collection.find_one({"message_id": self.message_id, "active": True})
-        if not giveaway:
-            await interaction.followup.send("This giveaway has ended or reset!", ephemeral=True)
-            return
-            
-        if user_id in giveaway.get("participants", []):
-            await interaction.followup.send("You are already in this giveaway!", ephemeral=True)
-            return
-
-        updated_giveaway = await giveaways_collection.find_one_and_update(
-            {"message_id": self.message_id, "active": True},
-            {"$addToSet": {"participants": user_id}},
-            return_document=ReturnDocument.AFTER
-        )
-        
-        if not updated_giveaway:
-            await interaction.followup.send("This giveaway has ended!", ephemeral=True)
-            return
-
-        participants_count = len(updated_giveaway["participants"])
-        button.label = f"Join 🎉 ({participants_count})"
-        
-        embed = interaction.message.embeds[0]
-        embed.set_footer(text=f"GiveawaySomething • {participants_count} Participants • Hosted by {self.host_name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
-        
-        try:
-            await interaction.message.edit(embed=embed, view=self)
-        except Exception:
-            pass
-            
-        await interaction.followup.send("🎉 You have successfully joined the giveaway!", ephemeral=True)
-
     @discord.ui.button(label="Leave ✖️", style=discord.ButtonStyle.danger, custom_id="leave_giveaway_btn")
     async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
         user_id = interaction.user.id
+        user_id_str = str(user_id)
         
         giveaway = await giveaways_collection.find_one({"message_id": self.message_id, "active": True})
         if not giveaway:
@@ -239,22 +203,77 @@ class GiveawayView(discord.ui.View):
 
         updated_giveaway = await giveaways_collection.find_one_and_update(
             {"message_id": self.message_id, "active": True},
-            {"$pull": {"participants": user_id}},
+            {"$pull": {"participants": user_id}, "$unset": {f"clicks.{user_id_str}": ""}},
             return_document=ReturnDocument.AFTER
         )
 
         participants_count = len(updated_giveaway["participants"]) if updated_giveaway else 0
-        self.children[0].label = f"Join 🎉 ({participants_count})"
-        
-        embed = interaction.message.embeds[0]
-        embed.set_footer(text=f"GiveawaySomething • {participants_count} Participants • Hosted by {self.host_name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
         
         try:
-            await interaction.message.edit(embed=embed, view=self)
+            channel = bot.get_channel(updated_giveaway["channel_id"])
+            msg = await channel.fetch_message(self.message_id)
+            embed = msg.embeds[0]
+            embed.set_footer(text=f"GiveawaySomething • {participants_count} Participants • Hosted by {self.host_name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
+            
+            main_view = GiveawayView(self.message_id, self.host_name)
+            main_view.children[0].label = f"ENTER 🎉 ({participants_count})"
+            
+            await msg.edit(embed=embed, view=main_view)
         except Exception:
             pass
             
-        await interaction.followup.send("You have left the giveaway.", ephemeral=True)
+        await interaction.followup.send("You have left the giveaway. Your clicks have been reset.", ephemeral=True)
+
+
+class GiveawayView(discord.ui.View):
+    def __init__(self, message_id: int, host_name: str):
+        super().__init__(timeout=None)
+        self.message_id = message_id
+        self.host_name = host_name
+
+    @discord.ui.button(label="ENTER 🎉 (0)", style=discord.ButtonStyle.success, custom_id="join_giveaway_btn")
+    async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        user_id = interaction.user.id
+        user_id_str = str(user_id)
+        
+        giveaway = await giveaways_collection.find_one({"message_id": self.message_id, "active": True})
+        if not giveaway:
+            await interaction.followup.send("This giveaway has ended or reset!", ephemeral=True)
+            return
+            
+        clicks = giveaway.get("clicks", {})
+        
+        if user_id not in giveaway.get("participants", []):
+            updated_giveaway = await giveaways_collection.find_one_and_update(
+                {"message_id": self.message_id, "active": True},
+                {"$addToSet": {"participants": user_id}, "$set": {f"clicks.{user_id_str}": 1}},
+                return_document=ReturnDocument.AFTER
+            )
+            
+            if not updated_giveaway:
+                await interaction.followup.send("This giveaway has ended!", ephemeral=True)
+                return
+
+            participants_count = len(updated_giveaway["participants"])
+            button.label = f"ENTER 🎉 ({participants_count})"
+            
+            embed = interaction.message.embeds[0]
+            embed.set_footer(text=f"GiveawaySomething • {participants_count} Participants • Hosted by {self.host_name}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
+            
+            try:
+                await interaction.message.edit(embed=embed, view=self)
+            except Exception:
+                pass
+                
+            await interaction.followup.send("🎉 You have successfully joined the giveaway!", ephemeral=True)
+        else:
+            await giveaways_collection.update_one(
+                {"message_id": self.message_id},
+                {"$inc": {f"clicks.{user_id_str}": 1}}
+            )
+            leave_view = LeaveView(self.message_id, self.host_name)
+            await interaction.followup.send("You are already in this giveaway! Would you like to leave?", view=leave_view, ephemeral=True)
 
 
 class DropView(discord.ui.View):
@@ -373,10 +392,11 @@ class RemoveParticipantUserSelect(discord.ui.UserSelect):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         user = self.values[0]
+        user_id_str = str(user.id)
         
         updated = await giveaways_collection.find_one_and_update(
             {"message_id": self.giveaway_message_id, "active": True, "participants": user.id},
-            {"$pull": {"participants": user.id}},
+            {"$pull": {"participants": user.id}, "$unset": {f"clicks.{user_id_str}": ""}},
             return_document=ReturnDocument.AFTER
         )
         
@@ -387,7 +407,7 @@ class RemoveParticipantUserSelect(discord.ui.UserSelect):
                 embed = msg.embeds[0]
                 embed.set_footer(text=f"GiveawaySomething • {len(updated['participants'])} Participants • Hosted by {updated['host_name']}", icon_url="https://cdn-icons-png.flaticon.com/512/3135/3135715.png")
                 view = GiveawayView(updated["message_id"], updated["host_name"])
-                view.children[0].label = f"Join 🎉 ({len(updated['participants'])})"
+                view.children[0].label = f"ENTER 🎉 ({len(updated['participants'])})"
                 await msg.edit(embed=embed, view=view)
             except Exception:
                 pass
@@ -460,7 +480,7 @@ async def start_giveaway(interaction: discord.Interaction, duration: str, prize:
 
     embed = discord.Embed(
         title=f"🎉 {prize} 🎉",
-        description=f"Click the **Join 🎉** button below to enter!\n\n⏱️ **Ends:** {timestamp_format}\n👑 **Hosted by:** {interaction.user.mention}\n🏆 **Winners:** {winners}",
+        description=f"Click the **ENTER 🎉** button below to join!\n\n⏱️ **Ends:** {timestamp_format}\n👑 **Hosted by:** {interaction.user.mention}\n🏆 **Winners:** {winners}",
         color=discord.Color.green(),
         timestamp=end_time
     )
@@ -485,6 +505,7 @@ async def start_giveaway(interaction: discord.Interaction, duration: str, prize:
         "winners_count": winners,
         "end_time": end_time.timestamp(),
         "participants": [],
+        "clicks": {},
         "active": True,
         "host_id": interaction.user.id,
         "host_name": interaction.user.name
