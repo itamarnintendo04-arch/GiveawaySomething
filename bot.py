@@ -7,6 +7,7 @@ import datetime
 import os
 import re
 import certifi
+from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 
@@ -15,6 +16,21 @@ MONGO_URI = os.getenv("MONGO_URI")
 db_client = AsyncIOMotorClient(MONGO_URI, tlsCAFile=certifi.where())
 db = db_client["giveaway_database"]
 giveaways_collection = db["giveaways"]
+
+
+# --- DUMMY WEB SERVER FOR RENDER ---
+async def health_check(request):
+    return web.Response(text="Bot is online and running successfully on Render!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Dummy web server started on port {port} to keep Render happy.")
 
 
 # --- DISCORD BOT CLASS WITH GRACEFUL SHUTDOWN ---
@@ -179,7 +195,7 @@ class LeaveView(discord.ui.View):
         except Exception:
             pass
             
-        await interaction.followup.send("You have left the giveaway.", ephemeral=True)
+        await interaction.followup.send("You have left the giveaway. Your clicks have been reset.", ephemeral=True)
 
 
 class GiveawayView(discord.ui.View):
@@ -518,12 +534,17 @@ async def remove_participant_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("⚠️ Select a giveaway from the menu below first:", view=view, ephemeral=True)
 
 
-def main():
+async def main():
     TOKEN = os.getenv("DISCORD_TOKEN")
     if not TOKEN:
         print("Error: DISCORD_TOKEN environment variable is missing!")
         return
-    bot.run(TOKEN)
+    
+    # הפעלת שרת הדמה כדי ש-Render יזהה פורט פתוח
+    await start_web_server()
+    
+    # הפעלת הבוט
+    await bot.start(TOKEN)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
