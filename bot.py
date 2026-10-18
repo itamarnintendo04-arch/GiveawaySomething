@@ -1,7 +1,6 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-from aiohttp import web
 import asyncio
 import random
 import datetime
@@ -10,48 +9,6 @@ import re
 import certifi
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
-
-# --- FAKE LANDING PAGE WEB SERVER ---
-HTML_PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GiveawaySomething Bot</title>
-    <style>
-        body { background-color: #0f172a; color: #ffffff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; text-align: center; }
-        .container { background: #1e293b; padding: 40px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); max-width: 400px; width: 90%; border: 1px solid #334155; }
-        h1 { color: #38bdf8; margin-bottom: 10px; }
-        p { color: #94a3b8; font-size: 1.1em; margin-bottom: 25px; }
-        .status { display: inline-block; padding: 8px 16px; background-color: #22c55e; color: #ffffff; border-radius: 20px; font-weight: bold; font-size: 0.9em; margin-bottom: 20px; }
-        .btn { display: inline-block; background-color: #5865F2; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🎉 GiveawaySomething</h1>
-        <div class="status">● Bot Status: ONLINE</div>
-        <p>The ultimate giveaway & quick-drop bot for your Discord server.</p>
-        <a href="#" class="btn">Add to Discord</a>
-    </div>
-</body>
-</html>
-"""
-
-async def handle_index(request):
-    return web.Response(text=HTML_PAGE, content_type='text/html')
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle_index)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"Web server started on port {port}")
-
 
 # --- MONGODB SETUP ---
 MONGO_URI = os.getenv("MONGO_URI")
@@ -242,8 +199,6 @@ class GiveawayView(discord.ui.View):
             await interaction.followup.send("This giveaway has ended or reset!", ephemeral=True)
             return
             
-        clicks = giveaway.get("clicks", {})
-        
         if user_id not in giveaway.get("participants", []):
             updated_giveaway = await giveaways_collection.find_one_and_update(
                 {"message_id": self.message_id, "active": True},
@@ -296,7 +251,7 @@ class DropView(discord.ui.View):
         button.style = discord.ButtonStyle.secondary
 
         embed = discord.Embed(title="⚡ DROP CLAIMED! ⚡", description=f"**Prize:** {self.prize}\n**Winner:** {winner.mention}\n**Hosted by:** {self.host.mention}", color=discord.Color.gold(), timestamp=datetime.datetime.now(datetime.timezone.utc))
-        embed.set_footer(text=f"GiveawaySomething • Hosted by {self.host.name}")
+        embed.set_footer(text=f"GiveawaySomething • Fast Drop • Hosted by {self.host.name}")
 
         await interaction.message.edit(embed=embed, view=self)
         await interaction.response.send_message(f"🎉 Congratulations {winner.mention}! You claimed the drop for **{self.prize}**!")
@@ -313,7 +268,7 @@ class DropView(discord.ui.View):
                 pass
 
 
-# --- SELECT MENUS ---
+# --- SELECT MENUS & ADMIN COMMANDS ---
 class GiveawaySelect(discord.ui.Select):
     def __init__(self, giveaways_list):
         options = []
@@ -322,13 +277,11 @@ class GiveawaySelect(discord.ui.Select):
             count = len(g.get("participants", []))
             label = f"{prize_name[:80]} ({count} participants)"
             options.append(discord.SelectOption(label=label, value=str(g["message_id"])))
-        
         super().__init__(placeholder="Select a giveaway to view participants...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         msg_id = int(self.values[0])
-        
         giveaway = await giveaways_collection.find_one({"message_id": msg_id})
         if not giveaway:
             await interaction.followup.send("❌ This giveaway does not exist!", ephemeral=True)
@@ -353,28 +306,18 @@ class GiveawaySelect(discord.ui.Select):
         if len(users_str) > 4000:
             users_str = users_str[:3900] + "\n... (too many participants to display completely)"
 
-        embed = discord.Embed(
-            title=f"📋 Participants: {prize}",
-            description=f"**Total Participants:** {len(participants)}\n\n{users_str}",
-            color=discord.Color.blue()
-        )
+        embed = discord.Embed(title=f"📋 Participants: {prize}", description=f"**Total Participants:** {len(participants)}\n\n{users_str}", color=discord.Color.blue())
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class ForceEndSelect(discord.ui.Select):
     def __init__(self, giveaways_list):
-        options = []
-        for g in giveaways_list:
-            prize_name = g["prize"]
-            label = f"{prize_name[:90]}"
-            options.append(discord.SelectOption(label=label, value=str(g["message_id"])))
-        
+        options = [discord.SelectOption(label=f"{g['prize'][:90]}", value=str(g["message_id"])) for g in giveaways_list]
         super().__init__(placeholder="Select a giveaway to end IMMEDIATELY...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         msg_id = int(self.values[0])
-        
         success = await process_giveaway_end(msg_id, bot, force_ended_by=interaction.user)
         if success:
             await interaction.followup.send("✅ Giveaway has been force-ended successfully!", ephemeral=True)
@@ -382,7 +325,6 @@ class ForceEndSelect(discord.ui.Select):
             await interaction.followup.send("❌ Failed to end giveaway. It might have already ended.", ephemeral=True)
 
 
-# --- REMOVE PARTICIPANT 2-STEP MENUS ---
 class RemoveParticipantUserSelect(discord.ui.UserSelect):
     def __init__(self, message_id: int, prize: str):
         super().__init__(placeholder=f"Select user to remove from {prize[:50]}...", min_values=1, max_values=1)
@@ -416,19 +358,16 @@ class RemoveParticipantUserSelect(discord.ui.UserSelect):
         else:
             await interaction.followup.send(f"❌ {user.mention} is not registered in this giveaway.", ephemeral=True)
 
+
 class RemoveParticipantGiveawaySelect(discord.ui.Select):
     def __init__(self, giveaways_list):
-        options = []
-        for g in giveaways_list:
-            label = f"{g['prize'][:90]}"
-            options.append(discord.SelectOption(label=label, value=str(g["message_id"])))
+        options = [discord.SelectOption(label=f"{g['prize'][:90]}", value=str(g["message_id"])) for g in giveaways_list]
         super().__init__(placeholder="Step 1: Select a giveaway...", min_values=1, max_values=1, options=options)
         self.giveaways_list = giveaways_list
 
     async def callback(self, interaction: discord.Interaction):
         msg_id = int(self.values[0])
         prize = next((g["prize"] for g in self.giveaways_list if g["message_id"] == msg_id), "Giveaway")
-        
         view = discord.ui.View(timeout=60)
         view.add_item(RemoveParticipantUserSelect(msg_id, prize))
         await interaction.response.edit_message(content=f"Step 2: Select the user to remove from **{prize}**:", view=view)
@@ -579,14 +518,12 @@ async def remove_participant_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("⚠️ Select a giveaway from the menu below first:", view=view, ephemeral=True)
 
 
-async def main():
+def main():
     TOKEN = os.getenv("DISCORD_TOKEN")
     if not TOKEN:
         print("Error: DISCORD_TOKEN environment variable is missing!")
         return
-
-    await start_web_server()
-    await bot.start(TOKEN)
+    bot.run(TOKEN)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
