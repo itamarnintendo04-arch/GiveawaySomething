@@ -11,12 +11,23 @@ from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 
-# --- MONGODB SETUP ---
-MONGO_URI = os.getenv("MONGO_URI")
-db_client = AsyncIOMotorClient(MONGO_URI, tlsCAFile=certifi.where())
-db = db_client["giveaway_database"]
-giveaways_collection = db["giveaways"]
+# --- MONGODB SETUP WITH CONNECTION HANDLING ---
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
 
+if not MONGO_URI:
+    print("WARNING: MONGO_URI environment variable is missing!")
+    db_client = None
+    db = None
+    giveaways_collection = None
+else:
+    try:
+        db_client = AsyncIOMotorClient(MONGO_URI, tlsCAFile=certifi.where())
+        db = db_client["giveaway_database"]
+        giveaways_collection = db["giveaways"]
+        print("Connected to MongoDB successfully!")
+    except Exception as e:
+        print(f"Failed to connect to MongoDB: {e}")
+        giveaways_collection = None
 
 # --- DUMMY WEB SERVER FOR RENDER ---
 async def health_check(request):
@@ -52,10 +63,15 @@ class GiveawayBot(commands.Bot):
 
     @tasks.loop(minutes=1)
     async def cleanup_missed_giveaways(self):
+        if giveaways_collection is None:
+            return
         now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-        cursor = giveaways_collection.find({"active": True, "end_time": {"$lte": now}})
-        async for giveaway in cursor:
-            await process_giveaway_end(giveaway["message_id"], self)
+        try:
+            cursor = giveaways_collection.find({"active": True, "end_time": {"$lte": now}})
+            async for giveaway in cursor:
+                await process_giveaway_end(giveaway["message_id"], self)
+        except Exception as e:
+            print(f"Error cleaning up missed giveaways: {e}")
 
     @cleanup_missed_giveaways.before_loop
     async def before_cleanup(self):
@@ -83,6 +99,9 @@ def parse_duration(time_str: str) -> int:
 
 # --- CORE GIVEAWAY END LOGIC ---
 async def process_giveaway_end(message_id: int, bot_instance: commands.Bot, force_ended_by=None):
+    if giveaways_collection is None:
+        return False
+        
     giveaway_data = await giveaways_collection.find_one_and_update(
         {"message_id": message_id, "active": True},
         {"$set": {"active": False}},
@@ -165,6 +184,10 @@ class LeaveView(discord.ui.View):
         user_id = interaction.user.id
         user_id_str = str(user_id)
         
+        if giveaways_collection is None:
+            await interaction.followup.send("Database connection error!", ephemeral=True)
+            return
+
         giveaway = await giveaways_collection.find_one({"message_id": self.message_id, "active": True})
         if not giveaway:
             await interaction.followup.send("This giveaway has ended or reset!", ephemeral=True)
@@ -210,6 +233,10 @@ class GiveawayView(discord.ui.View):
         user_id = interaction.user.id
         user_id_str = str(user_id)
         
+        if giveaways_collection is None:
+            await interaction.followup.send("Database connection error!", ephemeral=True)
+            return
+
         giveaway = await giveaways_collection.find_one({"message_id": self.message_id, "active": True})
         if not giveaway:
             await interaction.followup.send("This giveaway has ended or reset!", ephemeral=True)
@@ -298,6 +325,10 @@ class GiveawaySelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         msg_id = int(self.values[0])
+        
+        if giveaways_collection is None:
+            return await interaction.followup.send("Database error!", ephemeral=True)
+            
         giveaway = await giveaways_collection.find_one({"message_id": msg_id})
         if not giveaway:
             await interaction.followup.send("❌ This giveaway does not exist!", ephemeral=True)
@@ -352,6 +383,9 @@ class RemoveParticipantUserSelect(discord.ui.UserSelect):
         user = self.values[0]
         user_id_str = str(user.id)
         
+        if giveaways_collection is None:
+            return await interaction.followup.send("Database error!", ephemeral=True)
+
         updated = await giveaways_collection.find_one_and_update(
             {"message_id": self.giveaway_message_id, "active": True, "participants": user.id},
             {"$pull": {"participants": user.id}, "$unset": {f"clicks.{user_id_str}": ""}},
@@ -425,6 +459,9 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 async def start_giveaway(interaction: discord.Interaction, duration: str, prize: str, winners: int = 1):
     await interaction.response.defer(ephemeral=True)
 
+    if giveaways_collection is None:
+        return await interaction.followup.send("❌ Database connection error! Cannot start giveaway.", ephemeral=True)
+
     seconds = parse_duration(duration)
     if seconds <= 0:
         await interaction.followup.send("❌ Invalid duration format! Use formats like `30s`, `10m`, `2h`, or `1d`.", ephemeral=True)
@@ -492,6 +529,9 @@ async def start_drop(interaction: discord.Interaction, prize: str):
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def list_participants(interaction: discord.Interaction):
+    if giveaways_collection is None:
+        return await interaction.response.send_message("❌ Database connection error!", ephemeral=True)
+
     cursor = giveaways_collection.find({"active": True, "guild_id": interaction.guild.id})
     active_list = await cursor.to_list(length=25)
     
@@ -507,6 +547,9 @@ async def list_participants(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def force_end(interaction: discord.Interaction):
+    if giveaways_collection is None:
+        return await interaction.response.send_message("❌ Database connection error!", ephemeral=True)
+
     cursor = giveaways_collection.find({"active": True, "guild_id": interaction.guild.id})
     active_list = await cursor.to_list(length=25)
     
@@ -522,6 +565,9 @@ async def force_end(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def remove_participant_cmd(interaction: discord.Interaction):
+    if giveaways_collection is None:
+        return await interaction.response.send_message("❌ Database connection error!", ephemeral=True)
+
     cursor = giveaways_collection.find({"active": True, "guild_id": interaction.guild.id})
     active_list = await cursor.to_list(length=25)
     
