@@ -195,7 +195,7 @@ class LeaveView(discord.ui.View):
         except Exception:
             pass
             
-        await interaction.followup.send("You have left the giveaway. Your clicks have been reset.", ephemeral=True)
+        await interaction.followup.send("You have left the giveaway.", ephemeral=True)
 
 
 class GiveawayView(discord.ui.View):
